@@ -1,0 +1,8 @@
+rm -rf /dev/dragon
+mknod /dev/dragon c 241 1
+chown root /dev/dragon
+chmod 0644 /dev/dragon
+ls -al /dev/dragon
+
+./start_insmod
+
