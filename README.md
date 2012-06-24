@@ -6,4 +6,4 @@ defalut project path (specified in makefile):
 
 KNJN Dragon Linux driver
 
-Copyright 2012, OMEGA
+Copyright 2010-2012, OMEGA
