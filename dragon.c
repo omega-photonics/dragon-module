@@ -33,8 +33,15 @@ char           *gWriteBuffers[DRAGON_BUFFER_COUNT];            // Pointers to dw
 dma_addr_t      gWriteHWAddr[DRAGON_BUFFER_COUNT];             // Pointers to DMA buffers hardware addresses
 
 int BufferCount=0;
-
 int RequestedBufferNumber=0;
+
+uint16_t FrameLength=DRAGON_DEFAULT_FRAME_LENGTH;
+uint16_t FramesPerBuffer=DRAGON_DEFAULT_FRAMES_PER_BUFFER;
+bool HalfShiftEnabled=DRAGON_DEFAULT_HALF_SHIFT;
+bool AutoChannel=DRAGON_DEFAULT_CHANNEL_AUTO;
+bool ActiveChannel=DRAGON_DEFAULT_CHANNEL;
+uint16_t SyncOffset=DRAGON_DEFAULT_SYNC_OFFSET;
+uint16_t SyncWidth=DRAGON_DEFAULT_SYNC_WIDTH;
 
 void XPCIe_WriteReg (u32 dw_offset, u32 val)
 {
@@ -62,7 +69,16 @@ long XPCIe_Ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     switch (cmd)
     {
     case DRAGON_START:
-        XPCIe_WriteReg(1, arg);
+        if(arg>0)
+        {
+            XPCIe_WriteReg(0, 0); // activate
+            XPCIe_WriteReg(1, 1); // re-enable
+        }
+        else
+        {
+            XPCIe_WriteReg(1, 0); // disable
+            XPCIe_WriteReg(0, 1); // reset
+        }
         break;
     case DRAGON_QUEUE_BUFFER:
         if(arg<DRAGON_BUFFER_COUNT) XPCIe_WriteReg(2, gWriteHWAddr[arg]);
@@ -71,11 +87,52 @@ long XPCIe_Ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     case DRAGON_SET_DAC:
         XPCIe_WriteReg(3, arg);
         break;
-    case DRAGON_SET_REG1:
-        XPCIe_WriteReg(4, arg);
+    case DRAGON_SET_FRAME_LENGTH:
+        if(arg>=90 && arg<=49140)
+        {
+            if(arg%90!=0) arg=(arg+90)%90; // round up
+            FrameLength=arg;
+            XPCIe_WriteReg(7, (FrameLength/6)-1);
+//            XPCIe_WriteReg(0, 1); // reset
+//            XPCIe_WriteReg(0, 0); // activate
+//            XPCIe_WriteReg(1, 1); // re-enable
+            return arg;
+        }
+        else ret=-1;
         break;
-    case DRAGON_SET_REG2:
+    case DRAGON_SET_FRAME_PER_BUFFER_COUNT:
+        if(arg>=1 && arg*FrameLength<=32768*90)
+        {
+            FramesPerBuffer=arg;
+            XPCIe_WriteReg(6, (arg*FrameLength/90));
+//            XPCIe_WriteReg(0, 1); // reset
+//            XPCIe_WriteReg(0, 0); // activate
+//            XPCIe_WriteReg(1, 1); // re-enable
+        }
+        else ret=-1;
+        break;
+    case DRAGON_SET_SWITCH_PERIOD:
         XPCIe_WriteReg(5, arg);
+        break;
+    case DRAGON_SET_HALF_SHIFT:
+        HalfShiftEnabled=arg&1;
+        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
+        break;
+    case DRAGON_SET_CHANNEL_AUTO:
+        AutoChannel=arg&1;
+        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
+        break;
+    case DRAGON_SET_CHANNEL:
+        ActiveChannel=arg&1;
+        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
+        break;
+    case DRAGON_SET_SYNC_WIDTH:
+        SyncWidth=arg&127;
+        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
+        break;
+    case DRAGON_SET_SYNC_OFFSET:
+        SyncOffset=arg&511;
+        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
         break;
     case DRAGON_REQUEST_BUFFER_NUMBER:
         if(arg<DRAGON_BUFFER_COUNT) RequestedBufferNumber=arg;
@@ -114,7 +171,11 @@ static int XPCIe_init(void)
     else printk(KERN_WARNING"%s: Device enabled.\n", gDrvrName);
     pci_set_master(gDev);
     printk(KERN_WARNING"%s: MSI enabled.\n", gDrvrName);
-    request_irq(gDev->irq, XPCIe_IRQHandler, 0, gDrvrName, NULL);
+    if(0!=request_irq(gDev->irq, XPCIe_IRQHandler, 0, gDrvrName, NULL))
+    {
+        printk(KERN_WARNING"%s: Can not request IRQ.\n", gDrvrName);
+        return -1;
+    }
     printk(KERN_WARNING"%s: IRQ requested.\n", gDrvrName);
     gStatFlags = gStatFlags | HAVE_IRQ;
     printk(KERN_WARNING"%s: Set bus master.\n", gDrvrName);
@@ -160,8 +221,11 @@ static int XPCIe_init(void)
     gStatFlags = gStatFlags | HAVE_KREG;
     printk("%s driver loaded\n", gDrvrName);
 
-    XPCIe_WriteReg(0, 1);                   // reset device
-    XPCIe_WriteReg(0, 0);                   // activate device
+//    XPCIe_WriteReg(0, 1);                   // reset device
+//    XPCIe_WriteReg(0, 0);                   // activate device
+    XPCIe_WriteReg(7, (FrameLength/6)-1);       // set frame length
+    XPCIe_WriteReg(6, (FramesPerBuffer*FrameLength/90)); //set frames per buffer
+    XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10)); //misc settings
 
     return 0;
 }
@@ -176,7 +240,6 @@ static void XPCIe_exit(void)
     for(BufferCount--; BufferCount>=0; BufferCount--)
     {
         pci_free_consistent(gDev, DRAGON_BUFFER_SIZE, gWriteBuffers[BufferCount], gWriteHWAddr[BufferCount]);
-
 //        if (NULL != gWriteBuffers[BufferCount])
 //            (void) kfree(gWriteBuffers[BufferCount]);
         gWriteBuffers[BufferCount] = NULL;

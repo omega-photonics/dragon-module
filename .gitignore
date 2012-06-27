@@ -1,0 +1,11 @@
+.dragon.ko.cmd
+.dragon.mod.o.cmd
+.dragon.o.cmd
+.tmp_versions/
+Module.symvers
+dragon.ko
+dragon.mod.c
+dragon.mod.o
+dragon.o
+modules.order
+
