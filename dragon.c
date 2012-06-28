@@ -93,9 +93,6 @@ long XPCIe_Ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             if(arg%90!=0) arg=(arg+90)%90; // round up
             FrameLength=arg;
             XPCIe_WriteReg(7, (FrameLength/6)-1);
-//            XPCIe_WriteReg(0, 1); // reset
-//            XPCIe_WriteReg(0, 0); // activate
-//            XPCIe_WriteReg(1, 1); // re-enable
             return arg;
         }
         else ret=-1;
@@ -105,9 +102,6 @@ long XPCIe_Ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
         {
             FramesPerBuffer=arg;
             XPCIe_WriteReg(6, (arg*FrameLength/90));
-//            XPCIe_WriteReg(0, 1); // reset
-//            XPCIe_WriteReg(0, 0); // activate
-//            XPCIe_WriteReg(1, 1); // re-enable
         }
         else ret=-1;
         break;
@@ -221,11 +215,14 @@ static int XPCIe_init(void)
     gStatFlags = gStatFlags | HAVE_KREG;
     printk("%s driver loaded\n", gDrvrName);
 
-//    XPCIe_WriteReg(0, 1);                   // reset device
-//    XPCIe_WriteReg(0, 0);                   // activate device
     XPCIe_WriteReg(7, (FrameLength/6)-1);       // set frame length
     XPCIe_WriteReg(6, (FramesPerBuffer*FrameLength/90)); //set frames per buffer
     XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10)); //misc settings
+    XPCIe_WriteReg(1, 0); // disable
+    XPCIe_WriteReg(0, 1); // reset
+    XPCIe_WriteReg(0, 0); // activate
+    XPCIe_WriteReg(1, 1); // re-enable
+    XPCIe_WriteReg(2, gWriteHWAddr[0]);      //write 1st buffer
 
     return 0;
 }
