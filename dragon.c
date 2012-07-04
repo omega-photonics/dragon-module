@@ -1,3 +1,4 @@
+#include <linux/cdev.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -7,246 +8,774 @@
 #include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/poll.h>
 #include <asm/uaccess.h>
+
+
 #include "dragon.h"
 
 MODULE_LICENSE("Dual BSD/GPL");
 
-#define PCI_VENDOR_ID_XILINX      0x10ee
-#define PCI_DEVICE_ID_XILINX_PCIE 0x0007
+#define DRAGON_VID      0x10EE
+#define DRAGON_DID      0x0007
+#define DRAGON_MAXNUM_DEVS 256
 
-#define DRAGON_REGISTER_SIZE      (4*8)    // There are eight registers, and each is 4 bytes wide.
-#define HAVE_REGION               0x01     // I/O Memory region
-#define HAVE_IRQ                  0x02     // Interupt
-#define HAVE_KREG                 0x04     // Kernel registration
+#define DRAGON_DEFAULT_FRAME_LENGTH 49140
+#define DRAGON_DEFAULT_FRAMES_PER_BUFFER 60
+#define DRAGON_DEFAULT_SWITCH_PERIOD (1 << 24)
+#define DRAGON_DEFAULT_HALF_SHIFT 0
+#define DRAGON_DEFAULT_CHANNEL_AUTO 0
+#define DRAGON_DEFAULT_CHANNEL 0
+#define DRAGON_DEFAULT_SYNC_OFFSET 0
+#define DRAGON_DEFAULT_SYNC_WIDTH 50
+#define DRAGON_BUFFER_ORDER 10
 
-int             gDrvrMajor = 241;           // Major number not dynamic.
-unsigned int    gStatFlags = 0x00;          // Status flags used for cleanup.
-unsigned long   gBaseHdwr;                  // Base register address (Hardware address)
-unsigned long   gBaseLen;                   // Base register address Length
-void           *gBaseVirt = NULL;           // Base register address (Virtual address, for I/O).
-char            gDrvrName[]= "dragon";      // Name of driver in proc.
-struct pci_dev *gDev = NULL;                // PCI device structure.
-int             gIrq;                       // IRQ assigned by PCI system.
+static const char DRV_NAME[] = "dragon";
+static struct class *dragon_class;
+static dev_t dragon_dev_number;
+DEFINE_SPINLOCK(dev_number_lock);
 
-char           *gWriteBuffers[DRAGON_BUFFER_COUNT];            // Pointers to dword aligned DMA buffer.
-dma_addr_t      gWriteHWAddr[DRAGON_BUFFER_COUNT];             // Pointers to DMA buffers hardware addresses
 
-int BufferCount=0;
-int RequestedBufferNumber=0;
+static const struct pci_device_id dragon_ids[] = {
+    { PCI_DEVICE(DRAGON_VID, DRAGON_DID) },
+    { 0 },
+};
 
-uint16_t FrameLength=DRAGON_DEFAULT_FRAME_LENGTH;
-uint16_t FramesPerBuffer=DRAGON_DEFAULT_FRAMES_PER_BUFFER;
-bool HalfShiftEnabled=DRAGON_DEFAULT_HALF_SHIFT;
-bool AutoChannel=DRAGON_DEFAULT_CHANNEL_AUTO;
-bool ActiveChannel=DRAGON_DEFAULT_CHANNEL;
-uint16_t SyncOffset=DRAGON_DEFAULT_SYNC_OFFSET;
-uint16_t SyncWidth=DRAGON_DEFAULT_SYNC_WIDTH;
+MODULE_DEVICE_TABLE(pci, dragon_ids);
 
-void XPCIe_WriteReg (u32 dw_offset, u32 val)
+typedef struct dragon_buffer_opaque
 {
-    writel(val, (gBaseVirt + (4 * dw_offset)));
+    dragon_buffer buf;
+    dma_addr_t dma_handle;
+    struct list_head qlist;
+    struct list_head dqlist;
+    atomic_t owned_by_cpu;
+} dragon_buffer_opaque;
+
+typedef struct dragon_private
+{
+    struct pci_dev *pci_dev;
+    struct cdev cdev;
+    dev_t cdev_no;
+    char dev_name[10];
+    void __iomem *io_buffer;
+    atomic_t dev_available;
+    dragon_params params;
+    dragon_buffer_opaque *buffers;
+    size_t buf_count;
+    struct list_head *qlist_head;
+    struct list_head *dqlist_head;
+    spinlock_t lists_lock;
+    wait_queue_head_t wait;
+} dragon_private;
+
+
+static void dragon_params_set_defaults(dragon_params* params)
+{
+    params->frame_length      = DRAGON_DEFAULT_FRAME_LENGTH;
+    params->frames_per_buffer = DRAGON_DEFAULT_FRAMES_PER_BUFFER;
+    params->switch_period     = DRAGON_DEFAULT_SWITCH_PERIOD;
+    params->half_shift        = DRAGON_DEFAULT_HALF_SHIFT;
+    params->channel_auto      = DRAGON_DEFAULT_CHANNEL_AUTO;
+    params->channel           = DRAGON_DEFAULT_CHANNEL;
+    params->sync_offset       = DRAGON_DEFAULT_SYNC_OFFSET;
+    params->sync_width        = DRAGON_DEFAULT_SYNC_WIDTH;
 }
 
-static irqreturn_t XPCIe_IRQHandler(int irq, void *data)
+static int dragon_check_params(dragon_params* params)
 {
-    printk(KERN_INFO "%s IRQ: %d", gDrvrName, irq);
-    return IRQ_HANDLED;
-}
+    if (!params)
+        return -EINVAL;
 
-static int XPCIe_MMap(struct file *filp, struct vm_area_struct *vma)
-{
-    printk(KERN_INFO"%s: mmap buffer %d\n", gDrvrName, RequestedBufferNumber);
-    if (remap_pfn_range(vma, vma->vm_start, gWriteHWAddr[RequestedBufferNumber] >> PAGE_SHIFT, vma->vm_end - vma->vm_start, vma->vm_page_prot))
-        return -EAGAIN;
+    if (90 <= params->frame_length && params->frame_length <= 49140)
+    {
+        params->frame_length =
+            ((params->frame_length - 1)/90 + 1)*90; //round up
+    }
+    else
+    {
+        printk(KERN_INFO "Bad dragon frame_length value\n");
+        return -EINVAL;
+    }
+
+    if (!params->frames_per_buffer ||
+        params->frames_per_buffer*params->frame_length > 32768*90)
+    {
+        printk(KERN_INFO "Bad dragon frames_per_buffer value\n");
+        return -EINVAL;
+    }
+
+    if (1 <= params->switch_period && params->switch_period <= (1 << 24))
+    {
+        params->switch_period =
+            ( (params->switch_period - params->frames_per_buffer) /
+              params->frames_per_buffer + 1)*params->frames_per_buffer; //round up
+    }
+    else
+    {
+        printk(KERN_INFO "Bad dragon switch_period value\n");
+        return -EINVAL;
+    }
+
+    params->half_shift &= 1;
+    params->channel_auto &= 1;
+    params->channel &= 1;
+
+    if (params->sync_offset > 511)
+    {
+        printk(KERN_INFO "Bad dragon sync_offset value\n");
+        return -EINVAL;
+    }
+
+    if (params->sync_offset > 127)
+    {
+        printk(KERN_INFO "Bad dragon sync_offset value\n");
+        return -EINVAL;
+    }
+
     return 0;
 }
 
-long XPCIe_Ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static inline void dragon_write_reg32(dragon_private* private,
+                                      uint32_t dw_offset, uint32_t val)
 {
-    int ret = 0;
+    writel(val, private->io_buffer + ((dw_offset) << 2));
+}
 
-    switch (cmd)
+static void dragon_write_params(dragon_private* private,
+                                dragon_params* params)
+{
+#ifdef VAL_CHANGED
+#undef VAL_CHANGED
+#endif
+#define VAL_CHANGED(name)                                               \
+    ((params) ? ( (params->name != private->params.name) ?              \
+                  (private->params.name = params->name, 1) : 0   ) : 1)
+#ifdef VAL
+#undef VAL
+#endif
+#define VAL(name) private->params.name
+
+    if (VAL_CHANGED(frame_length))
     {
-    case DRAGON_START:
-        if(arg>0)
+        dragon_write_reg32(private, 7, VAL(frame_length)/6 - 1);
+    }
+
+    if (VAL_CHANGED(frames_per_buffer))
+    {
+        dragon_write_reg32(private, 6,
+                           VAL(frames_per_buffer)*VAL(frame_length)/90);
+    }
+
+    if (VAL_CHANGED(switch_period))
+    {
+        dragon_write_reg32(private, 5, VAL(switch_period));
+    }
+
+    if (  VAL_CHANGED(half_shift)   |
+          VAL_CHANGED(channel_auto) |
+          VAL_CHANGED(channel)      |
+          VAL_CHANGED(sync_width)   |
+          VAL_CHANGED(sync_offset)  )
+    {
+        dragon_write_reg32( private, 4,
+                            (VAL(sync_width))        |
+                            (VAL(channel) << 7)      |
+                            (VAL(channel_auto) << 8) |
+                            (VAL(half_shift) << 9)   |
+                            (VAL(sync_offset) << 10) );
+    }
+
+#undef  VAL
+#undef  VAL_CHANGED
+}
+
+static long dragon_set_activity(dragon_private *private, int arg)
+{
+    if (arg)
+    {
+        dragon_write_reg32(private, 0, 0); // activate
+        dragon_write_reg32(private, 1, 1); // re-enable
+    }
+    else
+    {
+        dragon_write_reg32(private, 1, 0); // disable
+        dragon_write_reg32(private, 0, 1); // reset
+    }
+
+    return 0;
+}
+
+static void dragon_release_buffers(dragon_private* private)
+{
+    int i;
+
+    if (private->buffers)
+    {
+        for (i = 0; i < private->buf_count; i++)
+       {
+            pci_unmap_single(private->pci_dev, private->buffers[i].dma_handle,
+                             private->buffers[i].buf.len, PCI_DMA_FROMDEVICE);
+
+            free_pages((unsigned long)private->buffers[i].buf.ptr,
+                       DRAGON_BUFFER_ORDER);
+        }
+
+        vfree(private->buffers);
+
+        private->buffers = 0;
+        private->buf_count = 0;
+    }
+
+    private->qlist_head = 0;
+    private->dqlist_head = 0;
+}
+
+static long dragon_request_buffers(dragon_private* private, size_t *count)
+{
+    size_t i, idx = 0;
+    dragon_buffer_opaque *buffers;
+    size_t buffer_size =
+        private->params.frame_length * private->params.frames_per_buffer;
+
+    if (!buffer_size || *count > DRAGON_MAX_BUFFER_COUNT)
+    {
+        *count = 0;
+        return -EINVAL;
+    }
+
+    if(get_order(buffer_size) > DRAGON_BUFFER_ORDER)
+    {
+        printk(KERN_INFO "dragon buffer size is too big\n");
+        return -EINVAL;
+    }
+
+
+    if (private->buf_count >= *count)
+    {
+        // buffers already available
+        *count = private->buf_count;
+        return 0;
+    }
+
+    buffers = vzalloc(*count*sizeof(dragon_buffer_opaque));
+    if (!buffers)
+    {
+        printk(KERN_INFO "dragon buffers array allocation failed\n");
+        return -ENOMEM;
+    }
+
+    if (private->buffers)
+    {
+        memcpy(buffers, private->buffers,
+               private->buf_count*sizeof(dragon_buffer));
+        vfree(private->buffers);
+        private->buffers = 0;
+        idx = private->buf_count;
+    }
+
+    for (i = idx; i < *count; i++)
+    {
+        if ( !(buffers[i].buf.ptr = (void*)
+               __get_free_pages(GFP_DMA32, DRAGON_BUFFER_ORDER)) )
         {
-            XPCIe_WriteReg(0, 0); // activate
-            XPCIe_WriteReg(1, 1); // re-enable
+            break;
+        }
+        buffers[i].buf.len = (1 << DRAGON_BUFFER_ORDER) << PAGE_SHIFT;
+
+        if (!(buffers[i].dma_handle = pci_map_single(private->pci_dev,
+                                                     buffers[i].buf.ptr,
+                                                     buffers[i].buf.len,
+                                                     PCI_DMA_FROMDEVICE)))
+        {
+            free_pages((unsigned long)buffers[i].buf.ptr, DRAGON_BUFFER_ORDER);
+            break;
+        }
+        buffers[i].buf.offset = buffers[i].dma_handle;
+        buffers[i].buf.idx = i;
+        atomic_set(&buffers[i].owned_by_cpu, 0);
+
+        INIT_LIST_HEAD(&buffers[i].qlist);
+        INIT_LIST_HEAD(&buffers[i].dqlist);
+    }
+
+    if (!i)
+    {
+        vfree(buffers);
+        printk(KERN_INFO "dragon couldn't allocate or map buffer\n");
+        return -ENOMEM;
+    }
+
+    private->buffers = buffers;
+    private->buf_count = *count = i;
+
+    return 0;
+}
+
+static long dragon_query_buffer(dragon_private *private, dragon_buffer *buffer)
+{
+    if (!buffer || buffer->idx >= private->buf_count)
+    {
+         return -EINVAL;
+    }
+
+    *buffer = private->buffers[buffer->idx].buf;
+
+    return 0;
+}
+
+static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
+{
+    dragon_buffer_opaque *opaque;
+    unsigned long irq_flags;
+
+    if (!buffer || buffer->idx >= private->buf_count)
+    {
+        return -EINVAL;
+    }
+
+    opaque = &private->buffers[buffer->idx];
+
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
+
+    if (private->qlist_head)
+    {
+        list_add_tail(&opaque->qlist, private->qlist_head);
+    }
+    else
+    {
+        private->qlist_head = &opaque->qlist;
+    }
+
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
+
+    if (atomic_cmpxchg(&opaque->owned_by_cpu, 1, 0))
+    {
+        pci_dma_sync_single_for_device(private->pci_dev,
+                                       opaque->dma_handle,
+                                       opaque->buf.len,
+                                       PCI_DMA_FROMDEVICE);
+    }
+
+    dragon_write_reg32(private, 2, opaque->dma_handle);
+
+    return 0;
+}
+
+static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
+{
+
+    struct list_head *dqlist_next = 0;
+    dragon_buffer_opaque *opaque;
+    long err = 0;
+    unsigned long irq_flags;
+
+
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
+    if (!private->dqlist_head)
+    {
+        err = -EAGAIN;
+    }
+    else
+    {
+        if (!list_empty(private->dqlist_head))
+        {
+            dqlist_next = private->dqlist_head->next;
+        }
+
+        opaque = list_entry(private->dqlist_head, dragon_buffer_opaque, dqlist);
+        *buffer = opaque->buf;
+
+        list_del_init(private->dqlist_head);
+        private->dqlist_head = dqlist_next;
+    }
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
+
+    if (!err && !atomic_cmpxchg(&opaque->owned_by_cpu, 0, 1))
+    {
+        pci_dma_sync_single_for_cpu(private->pci_dev,
+                                    opaque->dma_handle,
+                                    opaque->buf.len,
+                                    PCI_DMA_FROMDEVICE);
+    }
+
+    return err;
+}
+
+static void dragon_switch_one_buffer(dragon_private *private)
+{
+    struct list_head *qlist_next = 0;
+    dragon_buffer_opaque *opaque;
+    unsigned long irq_flags;
+
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
+    if (!private->qlist_head)
+    {
+        printk(KERN_INFO "Buffers queue is empty\n");
+    }
+    else
+    {
+        if (!list_empty(private->qlist_head))
+        {
+            qlist_next = private->qlist_head->next;
+        }
+        list_del_init(private->qlist_head);
+
+        opaque = list_entry(private->qlist_head, dragon_buffer_opaque, qlist);
+        if (private->dqlist_head)
+        {
+            list_add_tail(&opaque->dqlist, private->dqlist_head);
         }
         else
         {
-            XPCIe_WriteReg(1, 0); // disable
-            XPCIe_WriteReg(0, 1); // reset
+            private->dqlist_head = &opaque->dqlist;
         }
+
+        private->qlist_head = qlist_next;
+
+        opaque = list_entry(private->dqlist_head, dragon_buffer_opaque, dqlist);
+    }
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
+}
+
+static long dragon_ioctl(struct file *file,
+                        unsigned int cmd, unsigned long arg)
+{
+    int err = 0;
+    void* parg = (void*)arg;
+    dragon_private* private = file->private_data;
+
+    if (!private)
+    {
+        printk(KERN_INFO "private is empty\n");
+        return -1;
+    }
+
+    switch (cmd)
+    {
+    case DRAGON_SET_ACTIVITY:
+        err = dragon_set_activity(private, arg);
         break;
-    case DRAGON_QUEUE_BUFFER:
-        if(arg<DRAGON_BUFFER_COUNT) XPCIe_WriteReg(2, gWriteHWAddr[arg]);
-        else ret=-1;
-        break;
+
     case DRAGON_SET_DAC:
-        XPCIe_WriteReg(3, arg);
+        dragon_write_reg32(private, 3, arg);
         break;
-    case DRAGON_SET_FRAME_LENGTH:
-        if(arg>=90 && arg<=49140)
+
+    case DRAGON_QUERY_PARAMS:
+        if (parg)
+            *(dragon_params*)parg = private->params;
+        break;
+
+    case DRAGON_SET_PARAMS:
+        if (dragon_check_params(parg))
+            return -EINVAL;
+        dragon_write_params(private, parg);
+        break;
+
+    case DRAGON_REQUEST_BUFFERS:
+        err = dragon_request_buffers(private, parg);
+        break;
+
+    case DRAGON_QUERY_BUFFER:
+        err = dragon_query_buffer(private, parg);
+        break;
+
+    case DRAGON_QBUF:
+        err = dragon_qbuf(private, parg);
+        break;
+
+    case DRAGON_DQBUF:
+        err = dragon_dqbuf(private, parg);
+        break;
+
+    default: err = -EINVAL;
+    }
+
+    return err;
+}
+
+
+static irqreturn_t dragon_irq_handler(int irq, void *data)
+{
+    dragon_private *private = data;
+
+    if (!private || private->pci_dev->irq != irq)
+    {
+        return IRQ_NONE;
+    }
+
+    dragon_switch_one_buffer(private);
+
+    wake_up_interruptible(&private->wait);
+
+    return IRQ_HANDLED;
+}
+
+static int dragon_open(struct inode *inode, struct file *file)
+{
+    unsigned long mmio_length;
+    dragon_private* private = container_of(inode->i_cdev, dragon_private, cdev);
+
+    if (!private)
+        return -1;
+
+    file->private_data = private;
+
+    printk(KERN_INFO "trying to open dragon device %d\n", MINOR(private->cdev_no));
+
+    if ( !atomic_dec_and_test(&private->dev_available) )
+    {
+        atomic_inc(&private->dev_available);
+        printk(KERN_INFO "device %d is busy\n", MINOR(private->cdev_no));
+        return -EBUSY;
+    }
+
+    if ( pci_enable_device(private->pci_dev) )
+    {
+        printk(KERN_INFO "pci_enable_device() failed\n");
+        goto err_pci_enable_device;
+    }
+
+    pci_set_master(private->pci_dev);
+
+    //Request region for BAR0
+    if ( pci_request_region(private->pci_dev, 0, private->dev_name) )
+    {
+        printk(KERN_INFO "pci_request_region() failed\n");
+        goto err_pci_request_region;
+    }
+    mmio_length = pci_resource_len(private->pci_dev, 0);
+    private->io_buffer = pci_iomap(private->pci_dev, 0, mmio_length);
+
+    //Init IRQ
+    if ( request_irq(private->pci_dev->irq, dragon_irq_handler, 0,
+                     private->dev_name, private) )
+    {
+        printk(KERN_INFO "request_irq() failed\n");
+        goto err_request_irq;
+    }
+
+    //Init wait queue head
+    init_waitqueue_head(&private->wait);
+
+    //Write default params to device
+    dragon_params_set_defaults(&private->params);
+    dragon_write_params(private, NULL);
+
+    printk(KERN_INFO "successfully open dragon device %d\n", MINOR(private->cdev_no));
+
+    return 0;
+
+
+err_request_irq:
+    pci_iounmap(private->pci_dev, private->io_buffer);
+    pci_release_region(private->pci_dev, 0);
+err_pci_request_region:
+    pci_clear_master(private->pci_dev);
+    pci_disable_device(private->pci_dev);
+err_pci_enable_device:
+    atomic_inc(&private->dev_available);
+
+    return -1;
+}
+
+static int dragon_release(struct inode *inode, struct file *file)
+{
+    dragon_private* private = container_of(inode->i_cdev, dragon_private, cdev);
+    if (!private)
+        return -1;
+
+    printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
+
+    free_irq(private->pci_dev->irq, private);
+
+    pci_iounmap(private->pci_dev, private->io_buffer);
+
+    pci_release_region(private->pci_dev, 0);
+
+    pci_clear_master(private->pci_dev);
+
+    pci_disable_device(private->pci_dev);
+
+    dragon_release_buffers(private);
+
+    atomic_inc(&private->dev_available);
+
+    return 0;
+}
+
+static unsigned int dragon_poll(struct file *file, struct poll_table_struct *poll_table)
+{
+    dragon_private *private = file->private_data;
+    unsigned long irq_flags;
+    unsigned int ret = 0;
+
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
+    if (private->dqlist_head)
+    {
+        ret = POLLIN | POLLRDNORM;
+    }
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
+
+    if (!ret)
+    {
+        poll_wait(file, &private->wait, poll_table);
+
+        spin_lock_irqsave(&private->lists_lock, irq_flags);
+        if (private->dqlist_head)
         {
-            if(arg%90!=0) arg=(arg+90)%90; // round up
-            FrameLength=arg;
-            XPCIe_WriteReg(7, (FrameLength/6)-1);
-            return arg;
+            ret = POLLIN | POLLRDNORM;
         }
-        else ret=-1;
-        break;
-    case DRAGON_SET_FRAME_PER_BUFFER_COUNT:
-        if(arg>=1 && arg*FrameLength<=32768*90)
-        {
-            FramesPerBuffer=arg;
-            XPCIe_WriteReg(6, (arg*FrameLength/90));
-        }
-        else ret=-1;
-        break;
-    case DRAGON_SET_SWITCH_PERIOD:
-        XPCIe_WriteReg(5, arg);
-        break;
-    case DRAGON_SET_HALF_SHIFT:
-        HalfShiftEnabled=arg&1;
-        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
-        break;
-    case DRAGON_SET_CHANNEL_AUTO:
-        AutoChannel=arg&1;
-        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
-        break;
-    case DRAGON_SET_CHANNEL:
-        ActiveChannel=arg&1;
-        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
-        break;
-    case DRAGON_SET_SYNC_WIDTH:
-        SyncWidth=arg&127;
-        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
-        break;
-    case DRAGON_SET_SYNC_OFFSET:
-        SyncOffset=arg&511;
-        XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10));
-        break;
-    case DRAGON_REQUEST_BUFFER_NUMBER:
-        if(arg<DRAGON_BUFFER_COUNT) RequestedBufferNumber=arg;
-        else ret=-1;
-        break;
-    default:
-        break;
+        spin_unlock_irqrestore(&private->lists_lock, irq_flags);
     }
 
     return ret;
 }
 
-
-struct file_operations XPCIe_Intf =
+static int dragon_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    unlocked_ioctl:      XPCIe_Ioctl,
-    mmap:       XPCIe_MMap
-};
-
-
-static int XPCIe_init(void)
-{
-    gDev = pci_get_device (PCI_VENDOR_ID_XILINX, PCI_DEVICE_ID_XILINX_PCIE, gDev);
-    if (NULL == gDev)
-    {
-        printk(KERN_WARNING"%s: Init: Hardware not found.\n", gDrvrName);
-        return -1;
-    }
-
-    pci_enable_msi_block(gDev, 1);
-    if (0 > pci_enable_device(gDev))
-    {
-        printk(KERN_WARNING"%s: Device not enabled.\n", gDrvrName);
-        return -1;
-    }
-    else printk(KERN_WARNING"%s: Device enabled.\n", gDrvrName);
-    pci_set_master(gDev);
-    printk(KERN_WARNING"%s: MSI enabled.\n", gDrvrName);
-    if(0!=request_irq(gDev->irq, XPCIe_IRQHandler, 0, gDrvrName, NULL))
-    {
-        printk(KERN_WARNING"%s: Can not request IRQ.\n", gDrvrName);
-        return -1;
-    }
-    printk(KERN_WARNING"%s: IRQ requested.\n", gDrvrName);
-    gStatFlags = gStatFlags | HAVE_IRQ;
-    printk(KERN_WARNING"%s: Set bus master.\n", gDrvrName);
-    gIrq = gDev->irq;
-
-
-    gBaseHdwr = pci_resource_start (gDev, 0);
-    if (0 > gBaseHdwr)
-    {
-        printk(KERN_WARNING"%s: Base Address not set.\n", gDrvrName);
-        return -1;
-    }
-    gBaseLen = pci_resource_len (gDev, 0);
-    gBaseVirt = ioremap(gBaseHdwr, gBaseLen);
-    if (!gBaseVirt)
-    {
-        printk(KERN_WARNING"%s: Could not remap memory.\n", gDrvrName);
-        return -1;
-    }
-    if (0 > check_mem_region(gBaseHdwr, DRAGON_REGISTER_SIZE))
-    {
-        printk(KERN_WARNING"%s: Error: Memory region is in use!\n", gDrvrName);
-        return -1;
-    }
-    request_mem_region(gBaseHdwr, DRAGON_REGISTER_SIZE, "Dragon_Drv");
-    gStatFlags = gStatFlags | HAVE_REGION;
-    printk(KERN_INFO"%s: Init done\n",gDrvrName);
-    for(BufferCount=0; BufferCount<DRAGON_BUFFER_COUNT; BufferCount++)
-    {
-        gWriteBuffers[BufferCount] = pci_alloc_consistent(gDev, DRAGON_BUFFER_SIZE, &gWriteHWAddr[BufferCount]);
-        if (NULL == gWriteBuffers[BufferCount])
-        {
-            printk(KERN_CRIT"%s: Unable to allocate gBuffer %d.\n",gDrvrName, BufferCount);
-            return -1;
-        }
-    }
-    if (0 > register_chrdev(gDrvrMajor, gDrvrName, &XPCIe_Intf))
-    {
-        printk(KERN_WARNING"%s: Can not register module\n", gDrvrName);
-        return -1;
-    }
-    printk(KERN_INFO"%s: Module registered\n", gDrvrName);
-    gStatFlags = gStatFlags | HAVE_KREG;
-    printk("%s driver loaded\n", gDrvrName);
-
-    XPCIe_WriteReg(7, (FrameLength/6)-1);       // set frame length
-    XPCIe_WriteReg(6, (FramesPerBuffer*FrameLength/90)); //set frames per buffer
-    XPCIe_WriteReg(4, SyncWidth|(ActiveChannel<<7)|(AutoChannel<<8)|(HalfShiftEnabled<<9)|(SyncOffset<<10)); //misc settings
-    XPCIe_WriteReg(1, 0); // disable
-    XPCIe_WriteReg(0, 1); // reset
-    XPCIe_WriteReg(0, 0); // activate
-    XPCIe_WriteReg(1, 1); // re-enable
-    XPCIe_WriteReg(2, gWriteHWAddr[0]);      //write 1st buffer
+    if ( remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+                         vma->vm_end - vma->vm_start,
+                         vma->vm_page_prot) )
+        return -EAGAIN;
 
     return 0;
 }
 
+static const struct file_operations dragon_fops = {
+    .owner            =  THIS_MODULE,
+    .open             =  dragon_open,
+    .release          =  dragon_release,
+    .poll             =  dragon_poll,
+    .mmap             =  dragon_mmap,
+    .unlocked_ioctl   =  dragon_ioctl,
+};
 
-static void XPCIe_exit(void)
+static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
-    if (gStatFlags & HAVE_REGION)
-        (void) release_mem_region(gBaseHdwr, DRAGON_REGISTER_SIZE);
-    if (gStatFlags & HAVE_IRQ)
-        (void) free_irq(gIrq, gDev);
-    for(BufferCount--; BufferCount>=0; BufferCount--)
+    dev_t cdev_no;
+    struct dragon_private *private = 0;
+
+    private = kzalloc(sizeof(struct dragon_private), GFP_KERNEL);
+    if (!private)
     {
-        pci_free_consistent(gDev, DRAGON_BUFFER_SIZE, gWriteBuffers[BufferCount], gWriteHWAddr[BufferCount]);
-//        if (NULL != gWriteBuffers[BufferCount])
-//            (void) kfree(gWriteBuffers[BufferCount]);
-        gWriteBuffers[BufferCount] = NULL;
+        pci_set_drvdata(dev, 0);
+        printk(KERN_INFO "kzalloc() failed\n");
+        goto err_kzalloc;
     }
-    if (gBaseVirt != NULL) iounmap(gBaseVirt);
-    gBaseVirt = NULL;
-    if (gStatFlags & HAVE_KREG) unregister_chrdev(gDrvrMajor, gDrvrName);
-    gStatFlags = 0;
-    printk(KERN_ALERT"%s driver is unloaded\n", gDrvrName);
+    spin_lock_init(&private->lists_lock);
+    private->pci_dev = dev;
+    pci_set_drvdata(dev, private);
+
+    //FIXME: Reimplement with atomic counter (CAS operation)
+    spin_lock(&dev_number_lock);
+    cdev_no = dragon_dev_number++;
+    spin_unlock(&dev_number_lock);
+
+    private->cdev_no = cdev_no;
+
+    cdev_init(&private->cdev, &dragon_fops);
+    private->cdev.owner = THIS_MODULE;
+
+    if ( cdev_add(&private->cdev, private->cdev_no, 1) )
+    {
+        printk(KERN_INFO "cdev_add() failed\n");
+        goto err_cdev_add;
+    }
+
+    snprintf(private->dev_name, sizeof(private->dev_name),
+             "dragon%d", MINOR(private->cdev_no));
+
+    if ( IS_ERR(device_create(dragon_class, NULL, private->cdev_no, NULL,
+                              private->dev_name)) )
+    {
+        printk(KERN_INFO "device_create() failed\n");
+        goto err_device_create;
+    }
+
+    if ( pci_enable_msi(dev) )
+    {
+        printk(KERN_INFO "pci_enable_msi() failed\n");
+        goto err_pci_enable_msi;
+    }
+
+    if ( pci_set_dma_mask(dev, DMA_BIT_MASK(32)) )
+    {
+        printk(KERN_INFO "pci_set_dma_mask() 32-bit failed\n");
+        goto err_pci_set_dma_mask;
+    }
+
+    //set device availability flag
+    atomic_set(&private->dev_available, 1);
+
+    printk(KERN_INFO "probe dragon device %d complete\n", MINOR(private->cdev_no));
+
+    return 0;
+
+err_pci_set_dma_mask:
+    pci_disable_msi(dev);
+err_pci_enable_msi:
+    device_destroy(dragon_class, private->cdev_no);
+err_device_create:
+    cdev_del(&private->cdev);
+err_cdev_add:
+    kfree(private);
+err_kzalloc:
+    return -1;
 }
 
-module_init(XPCIe_init);
-module_exit(XPCIe_exit);
+static void __devexit remove(struct pci_dev *dev)
+{
+    struct dragon_private *private = pci_get_drvdata(dev);
+
+    if (!private) return;
+
+    pci_disable_msi(dev);
+
+    device_destroy(dragon_class, private->cdev_no);
+
+    cdev_del(&private->cdev);
+
+    printk(KERN_INFO "remove dragon device %d complete\n", MINOR(private->cdev_no));
+
+    kfree(private);
+}
+
+static struct pci_driver dragon_driver = {
+    .name = (char*)DRV_NAME,
+    .id_table = dragon_ids,
+    .probe = probe,
+    .remove = __devexit_p(remove),
+    /* resume, suspend are optional */
+};
+
+
+static int __init dragon_init(void)
+{
+    printk(KERN_INFO "dragon module init\n");
+
+    /* Request dynamic allocation of a device major number */
+    if (alloc_chrdev_region(&dragon_dev_number, 0,
+                            DRAGON_MAXNUM_DEVS, DRV_NAME) < 0) {
+        printk(KERN_INFO "can't register device\n");
+        return -1;
+    }
+
+    dragon_class = class_create(THIS_MODULE, DRV_NAME);
+
+    return pci_register_driver(&dragon_driver);
+}
+
+static void __exit dragon_exit(void)
+{
+    pci_unregister_driver(&dragon_driver);
+
+    class_destroy(dragon_class);
+
+    unregister_chrdev_region(MAJOR(dragon_dev_number), DRAGON_MAXNUM_DEVS);
+
+    printk(KERN_INFO "dragon module exit\n");
+}
+
+module_init(dragon_init);
+module_exit(dragon_exit);
