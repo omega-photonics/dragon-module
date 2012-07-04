@@ -66,6 +66,7 @@ typedef struct dragon_private
     struct list_head *qlist_head;
     struct list_head *dqlist_head;
     spinlock_t lists_lock;
+    spinlock_t page_table_lock;
     wait_queue_head_t wait;
 } dragon_private;
 
@@ -206,6 +207,35 @@ static long dragon_set_activity(dragon_private *private, int arg)
     return 0;
 }
 
+static void dragon_lock_pages(dragon_private* private,
+                              void* va, size_t size)
+{
+    int i;
+    struct page *pg = virt_to_page(va);
+
+    spin_lock(&private->page_table_lock);
+    for ( i = 0; i < PAGE_ALIGN(size) >> PAGE_SHIFT; ++i )
+    {
+        SetPageReserved(&pg[i]);
+    }
+    spin_unlock(&private->page_table_lock);
+}
+
+static void dragon_unlock_pages(dragon_private* private,
+                                void* va, size_t size)
+{
+    int i;
+    struct page *pg = virt_to_page(va);
+
+    spin_lock(&private->page_table_lock);
+    for ( i = 0; i < PAGE_ALIGN(size) >> PAGE_SHIFT; ++i )
+    {
+        ClearPageReserved(&pg[i]);
+    }
+    spin_unlock(&private->page_table_lock);
+
+}
+
 static void dragon_release_buffers(dragon_private* private)
 {
     int i;
@@ -216,6 +246,11 @@ static void dragon_release_buffers(dragon_private* private)
        {
             pci_unmap_single(private->pci_dev, private->buffers[i].dma_handle,
                              private->buffers[i].buf.len, PCI_DMA_FROMDEVICE);
+
+            //Unlock memory pages
+            dragon_unlock_pages(private,
+                                private->buffers[i].buf.ptr,
+                                private->buffers[i].buf.len);
 
             free_pages((unsigned long)private->buffers[i].buf.ptr,
                        DRAGON_BUFFER_ORDER);
@@ -297,6 +332,11 @@ static long dragon_request_buffers(dragon_private* private, size_t *count)
 
         INIT_LIST_HEAD(&buffers[i].qlist);
         INIT_LIST_HEAD(&buffers[i].dqlist);
+
+        //Lock memory pages
+        dragon_lock_pages(private,
+                          buffers[i].buf.ptr,
+                          buffers[i].buf.len);
     }
 
     if (!i)
@@ -664,6 +704,7 @@ static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto err_kzalloc;
     }
     spin_lock_init(&private->lists_lock);
+    spin_lock_init(&private->page_table_lock);
     private->pci_dev = dev;
     pci_set_drvdata(dev, private);
 
