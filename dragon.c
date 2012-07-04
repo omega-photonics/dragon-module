@@ -432,8 +432,6 @@ static void dragon_switch_one_buffer(dragon_private *private)
         }
 
         private->qlist_head = qlist_next;
-
-        opaque = list_entry(private->dqlist_head, dragon_buffer_opaque, dqlist);
     }
     spin_unlock_irqrestore(&private->lists_lock, irq_flags);
 }
