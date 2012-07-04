@@ -1,5 +1,0 @@
-#!/bin/sh -fx
-/sbin/insmod dragon.ko
-
-
-
