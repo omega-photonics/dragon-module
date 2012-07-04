@@ -740,9 +740,9 @@ static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto err_pci_enable_msi;
     }
 
-    if ( pci_set_dma_mask(dev, DMA_BIT_MASK(32)) )
+    if ( pci_set_dma_mask(dev, DMA_BIT_MASK(64)) )
     {
-        printk(KERN_INFO "pci_set_dma_mask() 32-bit failed\n");
+        printk(KERN_INFO "pci_set_dma_mask() 64-bit failed\n");
         goto err_pci_set_dma_mask;
     }
 
@@ -802,7 +802,11 @@ static int __init dragon_init(void)
         return -1;
     }
 
-    dragon_class = class_create(THIS_MODULE, DRV_NAME);
+    if( !(dragon_class = class_create(THIS_MODULE, DRV_NAME)) )
+    {
+        printk(KERN_INFO "dragon class creation failed\n");
+        return -1;
+    }
 
     return pci_register_driver(&dragon_driver);
 }
