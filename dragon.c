@@ -587,6 +587,8 @@ static int dragon_release(struct inode *inode, struct file *file)
 
     printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
 
+    dragon_set_activity(private, 0);
+
     free_irq(private->pci_dev->irq, private);
 
     pci_iounmap(private->pci_dev, private->io_buffer);
