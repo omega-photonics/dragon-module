@@ -29,6 +29,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define DRAGON_DEFAULT_SYNC_OFFSET 0
 #define DRAGON_DEFAULT_SYNC_WIDTH 50
 #define DRAGON_BUFFER_ORDER 10
+#define DRAGON_DEFAULT_DAC_DATA 0xFFFFFFFF
 
 static const char DRV_NAME[] = "dragon";
 static struct class *dragon_class;
@@ -81,6 +82,7 @@ static void dragon_params_set_defaults(dragon_params* params)
     params->channel           = DRAGON_DEFAULT_CHANNEL;
     params->sync_offset       = DRAGON_DEFAULT_SYNC_OFFSET;
     params->sync_width        = DRAGON_DEFAULT_SYNC_WIDTH;
+    params->dac_data          = DRAGON_DEFAULT_DAC_DATA;
 }
 
 static int dragon_check_params(dragon_params* params)
@@ -88,10 +90,10 @@ static int dragon_check_params(dragon_params* params)
     if (!params)
         return -EINVAL;
 
-    if (90 <= params->frame_length && params->frame_length <= 49140)
+    if (DRAGON_MIN_FRAME_LENGTH <= params->frame_length && params->frame_length <= DRAGON_MAX_FRAME_LENGTH)
     {
         params->frame_length =
-            ((params->frame_length - 1)/90 + 1)*90; //round up
+            ((params->frame_length - 1)/DRAGON_DATA_PER_PACKET + 1)*DRAGON_DATA_PER_PACKET; //round up
     }
     else
     {
@@ -100,7 +102,7 @@ static int dragon_check_params(dragon_params* params)
     }
 
     if (!params->frames_per_buffer ||
-        params->frames_per_buffer*params->frame_length > 32768*90)
+        params->frames_per_buffer*params->frame_length > DRAGON_MAX_FRAMES_PER_BUFFER*DRAGON_DATA_PER_PACKET)
     {
         printk(KERN_INFO "Bad dragon frames_per_buffer value\n");
         return -EINVAL;
@@ -108,9 +110,12 @@ static int dragon_check_params(dragon_params* params)
 
     if (1 <= params->switch_period && params->switch_period <= (1 << 24))
     {
+        if (params->switch_period < params->frames_per_buffer)
+            params->switch_period = params->frames_per_buffer;
+
         params->switch_period =
-            ( (params->switch_period - params->frames_per_buffer) /
-              params->frames_per_buffer + 1)*params->frames_per_buffer; //round up
+            ( (params->switch_period - params->frames_per_buffer) / params->frames_per_buffer + 1)
+                *params->frames_per_buffer; //round up
     }
     else
     {
@@ -185,6 +190,11 @@ static void dragon_write_params(dragon_private* private,
                             (VAL(channel_auto) << 8) |
                             (VAL(half_shift) << 9)   |
                             (VAL(sync_offset) << 10) );
+    }
+
+    if (VAL_CHANGED(dac_data))
+    {
+        dragon_write_reg32(private, 3, VAL(dac_data));
     }
 
 #undef  VAL
