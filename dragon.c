@@ -613,13 +613,13 @@ static int dragon_release(struct inode *inode, struct file *file)
 {
     dragon_private* private;
 
-    if (!inode || !file)
+    if (!file)
     {
-        printk(KERN_INFO "dragon release error: inode or file is zero\n");
+        printk(KERN_INFO "dragon release error: file is zero\n");
         return -1;
     }
 
-    private = container_of(inode->i_cdev, dragon_private, cdev);
+    private = file->private_data;
     if (!private)
     {
         printk(KERN_INFO "dragon release error: private data pointer is zero\n");
@@ -633,6 +633,8 @@ static int dragon_release(struct inode *inode, struct file *file)
     free_irq(private->pci_dev->irq, private);
 
     dragon_release_buffers(private);
+
+    file->private_data = 0;
 
     atomic_inc(&private->dev_available);
 
