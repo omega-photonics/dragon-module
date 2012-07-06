@@ -293,12 +293,13 @@ static long dragon_request_buffers(dragon_private* private, size_t *count)
         return 0;
     }
 
-    buffers = vzalloc(*count*sizeof(dragon_buffer_opaque));
+    buffers = vmalloc_32(*count*sizeof(dragon_buffer_opaque));
     if (!buffers)
     {
         printk(KERN_INFO "dragon buffers array allocation failed\n");
         return -ENOMEM;
     }
+    memset(buffers, 0, *count*sizeof(dragon_buffer_opaque));
 
     if (private->buffers)
     {
@@ -446,9 +447,8 @@ static void dragon_switch_one_buffer(dragon_private *private)
 {
     struct list_head *qlist_next = 0;
     dragon_buffer_opaque *opaque;
-    unsigned long irq_flags;
 
-    spin_lock_irqsave(&private->lists_lock, irq_flags);
+    spin_lock(&private->lists_lock);
     if (!private->qlist_head)
     {
         printk(KERN_INFO "Buffers queue is empty\n");
@@ -473,7 +473,7 @@ static void dragon_switch_one_buffer(dragon_private *private)
 
         private->qlist_head = qlist_next;
     }
-    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
+    spin_unlock(&private->lists_lock);
 }
 
 static long dragon_ioctl(struct file *file,
@@ -543,7 +543,6 @@ static irqreturn_t dragon_irq_handler(int irq, void *data)
     }
 
     dragon_switch_one_buffer(private);
-
     wake_up_interruptible(&private->wait);
 
     return IRQ_HANDLED;
@@ -551,15 +550,22 @@ static irqreturn_t dragon_irq_handler(int irq, void *data)
 
 static int dragon_open(struct inode *inode, struct file *file)
 {
-    unsigned long mmio_length;
-    dragon_private* private = container_of(inode->i_cdev, dragon_private, cdev);
+    dragon_private* private;
+
+    if (!inode || !file)
+    {
+        printk(KERN_INFO "dragon open error: inode or file is zero\n");
+        return -1;
+    }
+    private = container_of(inode->i_cdev, dragon_private, cdev);
 
     if (!private)
+    {
+        printk(KERN_INFO "dragon open error: private data pointer is zero\n");
         return -1;
+    }
 
     file->private_data = private;
-
-    printk(KERN_INFO "trying to open dragon device %d\n", MINOR(private->cdev_no));
 
     if ( !atomic_dec_and_test(&private->dev_available) )
     {
@@ -568,33 +574,21 @@ static int dragon_open(struct inode *inode, struct file *file)
         return -EBUSY;
     }
 
-    if ( pci_enable_device(private->pci_dev) )
-    {
-        printk(KERN_INFO "pci_enable_device() failed\n");
-        goto err_pci_enable_device;
-    }
+    // Disable device activity just in case
+    dragon_set_activity(private, 0);
 
-    pci_set_master(private->pci_dev);
-
-    //Request region for BAR0
-    if ( pci_request_region(private->pci_dev, 0, private->dev_name) )
-    {
-        printk(KERN_INFO "pci_request_region() failed\n");
-        goto err_pci_request_region;
-    }
-    mmio_length = pci_resource_len(private->pci_dev, 0);
-    private->io_buffer = pci_iomap(private->pci_dev, 0, mmio_length);
+    //Init wait queue head and spin locks
+    init_waitqueue_head(&private->wait);
+    spin_lock_init(&private->lists_lock);
+    spin_lock_init(&private->page_table_lock);
 
     //Init IRQ
     if ( request_irq(private->pci_dev->irq, dragon_irq_handler, 0,
                      private->dev_name, private) )
     {
         printk(KERN_INFO "request_irq() failed\n");
-        goto err_request_irq;
+        return -1;
     }
-
-    //Init wait queue head
-    init_waitqueue_head(&private->wait);
 
     //Write default params to device
     dragon_params_set_defaults(&private->params);
@@ -603,39 +597,30 @@ static int dragon_open(struct inode *inode, struct file *file)
     printk(KERN_INFO "successfully open dragon device %d\n", MINOR(private->cdev_no));
 
     return 0;
-
-
-err_request_irq:
-    pci_iounmap(private->pci_dev, private->io_buffer);
-    pci_release_region(private->pci_dev, 0);
-err_pci_request_region:
-    pci_clear_master(private->pci_dev);
-    pci_disable_device(private->pci_dev);
-err_pci_enable_device:
-    atomic_inc(&private->dev_available);
-
-    return -1;
 }
 
 static int dragon_release(struct inode *inode, struct file *file)
 {
-    dragon_private* private = container_of(inode->i_cdev, dragon_private, cdev);
-    if (!private)
+    dragon_private* private;
+
+    if (!inode || !file)
+    {
+        printk(KERN_INFO "dragon release error: inode or file is zero\n");
         return -1;
+    }
+
+    private = container_of(inode->i_cdev, dragon_private, cdev);
+    if (!private)
+    {
+        printk(KERN_INFO "dragon release error: private data pointer is zero\n");
+        return -1;
+    }
 
     printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
 
     dragon_set_activity(private, 0);
 
     free_irq(private->pci_dev->irq, private);
-
-    pci_iounmap(private->pci_dev, private->io_buffer);
-
-    pci_release_region(private->pci_dev, 0);
-
-    pci_clear_master(private->pci_dev);
-
-    pci_disable_device(private->pci_dev);
 
     dragon_release_buffers(private);
 
@@ -695,16 +680,17 @@ static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
     dev_t cdev_no;
     struct dragon_private *private = 0;
+    unsigned long mmio_length;
 
-    private = kzalloc(sizeof(struct dragon_private), GFP_KERNEL);
+    private = vmalloc_32(sizeof(struct dragon_private));
     if (!private)
     {
         pci_set_drvdata(dev, 0);
-        printk(KERN_INFO "kzalloc() failed\n");
-        goto err_kzalloc;
+        printk(KERN_INFO "vmalloc_32() failed\n");
+        goto err_alloc;
     }
-    spin_lock_init(&private->lists_lock);
-    spin_lock_init(&private->page_table_lock);
+    memset(private, 0, sizeof(struct dragon_private));
+
     private->pci_dev = dev;
     pci_set_drvdata(dev, private);
 
@@ -734,16 +720,39 @@ static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto err_device_create;
     }
 
-    if ( pci_enable_msi(dev) )
+    if ( pci_enable_device(private->pci_dev) )
+    {
+        printk(KERN_INFO "pci_enable_device() failed\n");
+        goto err_pci_enable_device;
+    }
+
+    if ( pci_enable_msi(private->pci_dev) )
     {
         printk(KERN_INFO "pci_enable_msi() failed\n");
         goto err_pci_enable_msi;
     }
 
+    pci_set_master(private->pci_dev);
+
     if ( pci_set_dma_mask(dev, DMA_BIT_MASK(64)) )
     {
         printk(KERN_INFO "pci_set_dma_mask() 64-bit failed\n");
         goto err_pci_set_dma_mask;
+    }
+
+    //Request region for BAR0
+    if ( pci_request_region(private->pci_dev, 0, private->dev_name) )
+    {
+        printk(KERN_INFO "pci_request_region() failed\n");
+        goto err_pci_request_region;
+    }
+    mmio_length = pci_resource_len(private->pci_dev, 0);
+    if ( !mmio_length ||
+         !(private->io_buffer =
+           pci_iomap(private->pci_dev, 0, mmio_length)) )
+    {
+        printk(KERN_INFO "pci_iomap mmio_length = %ld failed\n", mmio_length);
+        goto err_pci_iomap;
     }
 
     //set device availability flag
@@ -753,33 +762,49 @@ static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     return 0;
 
+err_pci_iomap:
+    pci_release_region(private->pci_dev, 0);
+err_pci_request_region:
 err_pci_set_dma_mask:
-    pci_disable_msi(dev);
+    pci_clear_master(private->pci_dev);
+    pci_disable_msi(private->pci_dev);
 err_pci_enable_msi:
+    pci_disable_device(private->pci_dev);
+err_pci_enable_device:
     device_destroy(dragon_class, private->cdev_no);
 err_device_create:
     cdev_del(&private->cdev);
 err_cdev_add:
-    kfree(private);
-err_kzalloc:
+    vfree(private);
+err_alloc:
+    pci_set_drvdata(dev, 0);
     return -1;
 }
 
 static void __devexit remove(struct pci_dev *dev)
 {
+    unsigned cdev_no;
     struct dragon_private *private = pci_get_drvdata(dev);
 
     if (!private) return;
 
+    cdev_no = MINOR(private->cdev_no);
+
+    pci_release_region(dev, 0);
+
     pci_disable_msi(dev);
+
+    pci_clear_master(dev);
+
+    pci_disable_device(dev);
 
     device_destroy(dragon_class, private->cdev_no);
 
     cdev_del(&private->cdev);
 
-    printk(KERN_INFO "remove dragon device %d complete\n", MINOR(private->cdev_no));
+    vfree(private);
 
-    kfree(private);
+    printk(KERN_INFO "remove dragon device %d complete\n", cdev_no);
 }
 
 static struct pci_driver dragon_driver = {
