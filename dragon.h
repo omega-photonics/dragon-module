@@ -51,20 +51,4 @@ typedef struct dragon_buffer
 #define DRAGON_QBUF                 _IOWR('D', 6, dragon_buffer*)
 #define DRAGON_DQBUF                _IOWR('D', 7, dragon_buffer*)
 
-
-
-/* enum */
-/* { */
-/*     DRAGON_SET_ACTIVITY=0xFF00, */
-/*     DRAGON_SET_DAC, */
-/*     DRAGON_REQUEST_BUFFERS, */
-/*     DRAGON_QUEUE_BUFFER, */
-/*     DRAGON_DEQUEUE_BUFFER, */
-
-
-/*     DRAGON_QUERY_PARAMS, */
-/*     DRAGON_SET_PARAMS, */
-/* }; */
-
-
 #endif //DRAGON_DEFINITIONS_HEADER
