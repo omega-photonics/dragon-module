@@ -5,8 +5,13 @@
 // not changeable - hardcoded in FPGA
 #define DRAGON_PACKET_SIZE_DWORDS  32
 #define DRAGON_PACKET_SIZE_BYTES  (DRAGON_PACKET_SIZE_DWORDS*4)
-#define DRAGON_BUFFER_SIZE      (4096 * 1024)
-#define DRAGON_PACKET_COUNT (DRAGON_BUFFER_SIZE/DRAGON_PACKET_SIZE_BYTES)
+
+#define DRAGON_DATA_PER_PACKET 90
+#define DRAGON_MIN_FRAME_LENGTH DRAGON_DATA_PER_PACKET
+#define DRAGON_MAX_FRAME_LENGTH 49140
+#define DRAGON_MAX_FRAMES_PER_BUFFER 32768
+#define DRAGON_MAX_DATA_IN_BUFFER (32768*90)
+
 
 // maximum buffers count in FIFO
 #define DRAGON_MAX_BUFFER_COUNT 512
@@ -25,6 +30,7 @@ typedef struct dragon_params
     char channel;            // select adc - 0 or 1; works only if channel_auto = 0
     unsigned  sync_offset;   // ticks, 0 to 511
     unsigned  sync_width;    // ticks, 0 to 127
+    uint32_t dac_data;       // four bytes for 4 adjustment DACs on dragon board
 } dragon_params;
 
 typedef struct dragon_buffer
