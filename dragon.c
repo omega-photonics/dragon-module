@@ -205,13 +205,14 @@ static long dragon_set_activity(dragon_private *private, int arg)
 {
     if (arg)
     {
-        dragon_write_reg32(private, 0, 0); // activate
-        dragon_write_reg32(private, 1, 1); // re-enable
+        dragon_write_reg32(private, 1, 1); // start DMA writing
     }
     else
     {
-        dragon_write_reg32(private, 1, 0); // disable
-        dragon_write_reg32(private, 0, 1); // reset
+        dragon_write_reg32(private, 1, 0); // disable DMA writing
+
+        dragon_write_reg32(private, 0, 1); // assert reset signal in FPGA: stop FIFOs, reset counters  
+        dragon_write_reg32(private, 0, 0); // deassert reset
     }
 
     return 0;
@@ -281,7 +282,8 @@ static long dragon_request_buffers(dragon_private* private, size_t *count)
     size_t i, idx = 0;
     dragon_buffer_opaque *buffers;
     size_t buffer_size =
-        private->params.frame_length * private->params.frames_per_buffer;
+        (private->params.frame_length/DRAGON_DATA_PER_PACKET)*DRAGON_PACKET_SIZE_BYTES*
+         private->params.frames_per_buffer;
 
     if (!buffer_size || *count > DRAGON_MAX_BUFFER_COUNT)
     {
