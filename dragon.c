@@ -211,7 +211,7 @@ static long dragon_set_activity(dragon_private *private, int arg)
     {
         dragon_write_reg32(private, 1, 0); // disable DMA writing
 
-        dragon_write_reg32(private, 0, 1); // assert reset signal in FPGA: stop FIFOs, reset counters  
+        dragon_write_reg32(private, 0, 1); // assert reset signal in FPGA: stop FIFOs, reset counters
         dragon_write_reg32(private, 0, 0); // deassert reset
     }
 
@@ -604,6 +604,7 @@ static int dragon_open(struct inode *inode, struct file *file)
 
     //Write default params to device
     dragon_params_set_defaults(&private->params);
+    dragon_check_params(&private->params);
     dragon_write_params(private, NULL);
 
     printk(KERN_INFO "successfully open dragon device %d\n", MINOR(private->cdev_no));

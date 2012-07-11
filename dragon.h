@@ -19,17 +19,17 @@
 
 typedef struct dragon_params
 {
-    unsigned  frame_length;  // in ticks, 90 to 49140,
-                             // must be multiple of 90 or will be rounded up
-    unsigned  frames_per_buffer; // count of frames in one buffer, 1 to 32768,
-                             // (frame_length*frames_per_buffer) must be less or equal 32768*90
-    unsigned  switch_period; // frames, 1 to 2^24, must be multiple of frames_per_buffer
+    uint32_t frame_length;  // in ticks, 90 to 49140,
+                            // must be multiple of 90 or will be rounded up
+    uint32_t frames_per_buffer; // count of frames in one buffer, 1 to 32768,
+                                // (frame_length*frames_per_buffer) must be less or equal 32768*90
+    uint32_t switch_period;  // frames, 1 to 2^24, must be multiple of frames_per_buffer
                              // or will be rounded up
-    char half_shift;         // 0 or 1 - shifts sync pulse 1/2tick forward
-    char channel_auto;       // 1: auto, 0: manual channel selection
-    char channel;            // select adc - 0 or 1; works only if channel_auto = 0
-    unsigned  sync_offset;   // ticks, 0 to 511
-    unsigned  sync_width;    // ticks, 0 to 127
+    uint32_t half_shift;     // 0 or 1 - shifts sync pulse 1/2tick forward
+    uint32_t channel_auto;   // 1: auto, 0: manual channel selection
+    uint32_t channel;        // select adc - 0 or 1; works only if channel_auto = 0
+    uint32_t sync_offset;    // ticks, 0 to 511
+    uint32_t sync_width;     // ticks, 0 to 127
     uint32_t dac_data;       // four bytes for 4 adjustment DACs on dragon board
 } dragon_params;
 
