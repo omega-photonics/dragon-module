@@ -145,7 +145,8 @@ static int dragon_check_params(dragon_params* params)
 static inline void dragon_write_reg32(dragon_private* private,
                                       uint32_t dw_offset, uint32_t val)
 {
-    writel(val, private->io_buffer + ((dw_offset) << 2));
+    iowrite32(val, private->io_buffer + ((dw_offset) << 2));
+    mmiowb();
 }
 
 static void dragon_write_params(dragon_private* private,
@@ -459,8 +460,9 @@ static void dragon_switch_one_buffer(dragon_private *private)
 {
     struct list_head *qlist_next = 0;
     dragon_buffer_opaque *opaque;
+    unsigned long irq_flags;
 
-    spin_lock(&private->lists_lock);
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
     if (!private->qlist_head)
     {
         printk(KERN_INFO "Buffers queue is empty\n");
@@ -485,7 +487,7 @@ static void dragon_switch_one_buffer(dragon_private *private)
 
         private->qlist_head = qlist_next;
     }
-    spin_unlock(&private->lists_lock);
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
 }
 
 static long dragon_ioctl(struct file *file,
