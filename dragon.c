@@ -676,6 +676,7 @@ static unsigned int dragon_poll(struct file *file, struct poll_table_struct *pol
 
 static int dragon_mmap(struct file *file, struct vm_area_struct *vma)
 {
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
     if ( remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
                          vma->vm_end - vma->vm_start,
                          vma->vm_page_prot) )
