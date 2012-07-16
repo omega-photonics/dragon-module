@@ -9,8 +9,10 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/poll.h>
+#include <linux/cleancache.h>
+#include <linux/pfn.h>
 #include <asm/uaccess.h>
-
+#include <asm/pgalloc.h>
 
 #include "dragon.h"
 
@@ -61,6 +63,7 @@ typedef struct dragon_private
     char dev_name[10];
     void __iomem *io_buffer;
     atomic_t dev_available;
+    atomic_t queue_length;
     dragon_params params;
     dragon_buffer_opaque *buffers;
     size_t buf_count;
@@ -229,6 +232,7 @@ static void dragon_lock_pages(dragon_private* private,
     for ( i = 0; i < PAGE_ALIGN(size) >> PAGE_SHIFT; ++i )
     {
         SetPageReserved(&pg[i]);
+        set_pages_uc(&pg[i], 1);
     }
     spin_unlock(&private->page_table_lock);
 }
@@ -242,6 +246,7 @@ static void dragon_unlock_pages(dragon_private* private,
     spin_lock(&private->page_table_lock);
     for ( i = 0; i < PAGE_ALIGN(size) >> PAGE_SHIFT; ++i )
     {
+        set_pages_wb(&pg[i], 1);
         ClearPageReserved(&pg[i]);
     }
     spin_unlock(&private->page_table_lock);
@@ -411,6 +416,7 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
                                        PCI_DMA_FROMDEVICE);
     }
 
+    atomic_inc(&private->queue_length);
     dragon_write_reg32(private, 2, opaque->dma_handle);
 
     return 0;
@@ -558,6 +564,7 @@ static irqreturn_t dragon_irq_handler(int irq, void *data)
 
     dragon_switch_one_buffer(private);
     wake_up_interruptible(&private->wait);
+    atomic_dec(&private->queue_length);
 
     return IRQ_HANDLED;
 }
@@ -595,6 +602,7 @@ static int dragon_open(struct inode *inode, struct file *file)
     init_waitqueue_head(&private->wait);
     spin_lock_init(&private->lists_lock);
     spin_lock_init(&private->page_table_lock);
+    atomic_set(&private->queue_length, 0);
 
     //Init IRQ
     if ( request_irq(private->pci_dev->irq, dragon_irq_handler, 0,
@@ -632,6 +640,9 @@ static int dragon_release(struct inode *inode, struct file *file)
     }
 
     printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
+
+    //Wait for completeness
+    while (atomic_read(&private->queue_length) > 0) msleep(100);
 
     dragon_set_activity(private, 0);
 
@@ -676,10 +687,12 @@ static unsigned int dragon_poll(struct file *file, struct poll_table_struct *pol
 
 static int dragon_mmap(struct file *file, struct vm_area_struct *vma)
 {
+    vma->vm_flags |= VM_IO | VM_RESERVED;
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-    if ( remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
-                         vma->vm_end - vma->vm_start,
-                         vma->vm_page_prot) )
+
+    if ( io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+                            vma->vm_end - vma->vm_start,
+                            vma->vm_page_prot) )
         return -EAGAIN;
 
     return 0;
