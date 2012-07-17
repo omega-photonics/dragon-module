@@ -232,7 +232,6 @@ static void dragon_lock_pages(dragon_private* private,
     for ( i = 0; i < PAGE_ALIGN(size) >> PAGE_SHIFT; ++i )
     {
         SetPageReserved(&pg[i]);
-        set_pages_uc(&pg[i], 1);
     }
     spin_unlock(&private->page_table_lock);
 }
@@ -246,7 +245,6 @@ static void dragon_unlock_pages(dragon_private* private,
     spin_lock(&private->page_table_lock);
     for ( i = 0; i < PAGE_ALIGN(size) >> PAGE_SHIFT; ++i )
     {
-        set_pages_wb(&pg[i], 1);
         ClearPageReserved(&pg[i]);
     }
     spin_unlock(&private->page_table_lock);
