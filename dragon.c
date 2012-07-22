@@ -25,6 +25,8 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define DRAGON_DEFAULT_FRAME_LENGTH 49140
 #define DRAGON_DEFAULT_FRAMES_PER_BUFFER 60
 #define DRAGON_DEFAULT_SWITCH_PERIOD (1 << 24)
+#define DRAGON_DEFAULT_SWITCH_AUTO 1
+#define DRAGON_DEFAULT_SWITCH_STATE 0
 #define DRAGON_DEFAULT_HALF_SHIFT 0
 #define DRAGON_DEFAULT_CHANNEL_AUTO 0
 #define DRAGON_DEFAULT_CHANNEL 0
@@ -80,6 +82,8 @@ static void dragon_params_set_defaults(dragon_params* params)
     params->frame_length      = DRAGON_DEFAULT_FRAME_LENGTH;
     params->frames_per_buffer = DRAGON_DEFAULT_FRAMES_PER_BUFFER;
     params->switch_period     = DRAGON_DEFAULT_SWITCH_PERIOD;
+    params->switch_auto       = DRAGON_DEFAULT_SWITCH_AUTO;
+    params->switch_state      = DRAGON_DEFAULT_SWITCH_STATE;
     params->half_shift        = DRAGON_DEFAULT_HALF_SHIFT;
     params->channel_auto      = DRAGON_DEFAULT_CHANNEL_AUTO;
     params->channel           = DRAGON_DEFAULT_CHANNEL;
@@ -129,6 +133,8 @@ static int dragon_check_params(dragon_params* params)
     params->half_shift &= 1;
     params->channel_auto &= 1;
     params->channel &= 1;
+    params->switch_auto &= 1;
+    params->switch_state &= 1;
 
     if (params->sync_offset > 511)
     {
@@ -177,9 +183,14 @@ static void dragon_write_params(dragon_private* private,
                            VAL(frames_per_buffer)*VAL(frame_length)/90);
     }
 
-    if (VAL_CHANGED(switch_period))
+    if (  VAL_CHANGED(switch_period)  |
+          VAL_CHANGED(switch_auto)    |
+          VAL_CHANGED(switch_state)   )
     {
-        dragon_write_reg32(private, 5, VAL(switch_period));
+        dragon_write_reg32(private, 5,
+                           VAL(switch_period)         |
+                           (VAL(switch_auto) << 24)   |
+                           (VAL(switch_state) << 25)  );
     }
 
     if (  VAL_CHANGED(half_shift)   |
