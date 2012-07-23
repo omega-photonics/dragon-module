@@ -25,6 +25,8 @@ typedef struct dragon_params
                                 // (frame_length*frames_per_buffer) must be less or equal 32768*90
     uint32_t switch_period;  // frames, 1 to 2^24, must be multiple of frames_per_buffer
                              // or will be rounded up
+    uint32_t switch_auto;    // 1 - auto (switch_period), 0 - manual
+    uint32_t switch_state;   // can be set 0 or 1 if switch_auto==0
     uint32_t half_shift;     // 0 or 1 - shifts sync pulse 1/2tick forward
     uint32_t channel_auto;   // 1: auto, 0: manual channel selection
     uint32_t channel;        // select adc - 0 or 1; works only if channel_auto = 0
