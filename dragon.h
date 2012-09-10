@@ -6,11 +6,11 @@
 #define DRAGON_PACKET_SIZE_DWORDS  32
 #define DRAGON_PACKET_SIZE_BYTES  (DRAGON_PACKET_SIZE_DWORDS*4)
 
-#define DRAGON_DATA_PER_PACKET 90
+#define DRAGON_DATA_PER_PACKET 120
 #define DRAGON_MIN_FRAME_LENGTH DRAGON_DATA_PER_PACKET
-#define DRAGON_MAX_FRAME_LENGTH 49140
+#define DRAGON_MAX_FRAME_LENGTH 65520
 #define DRAGON_MAX_FRAMES_PER_BUFFER 32768
-#define DRAGON_MAX_DATA_IN_BUFFER (32768*90)
+#define DRAGON_MAX_DATA_IN_BUFFER (32760*120)
 
 
 // maximum buffers count in FIFO
@@ -19,10 +19,10 @@
 
 typedef struct dragon_params
 {
-    uint32_t frame_length;  // in ticks, 90 to 49140,
-                            // must be multiple of 90 or will be rounded up
+    uint32_t frame_length;  // in ticks, 120 to 65520,
+                            // must be multiple of 120 or will be rounded up
     uint32_t frames_per_buffer; // count of frames in one buffer, 1 to 32768,
-                                // (frame_length*frames_per_buffer) must be less or equal 32768*90
+                                // (frame_length*frames_per_buffer) must be less or equal 65520*60
     uint32_t switch_period;  // frames, 1 to 2^24, must be multiple of frames_per_buffer
                              // or will be rounded up
     uint32_t switch_auto;    // 1 - auto (switch_period), 0 - manual
@@ -52,5 +52,6 @@ typedef struct dragon_buffer
 #define DRAGON_QUERY_BUFFER         _IOWR('D', 5, dragon_buffer*)
 #define DRAGON_QBUF                 _IOWR('D', 6, dragon_buffer*)
 #define DRAGON_DQBUF                _IOWR('D', 7, dragon_buffer*)
+#define DRAGON_GET_ID		    _IOWR('D', 8, uint32_t*)
 
 #endif //DRAGON_DEFINITIONS_HEADER

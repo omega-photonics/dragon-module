@@ -22,7 +22,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define DRAGON_DID      0x0007
 #define DRAGON_MAXNUM_DEVS 256
 
-#define DRAGON_DEFAULT_FRAME_LENGTH 49140
+#define DRAGON_DEFAULT_FRAME_LENGTH 65520
 #define DRAGON_DEFAULT_FRAMES_PER_BUFFER 60
 #define DRAGON_DEFAULT_SWITCH_PERIOD (1 << 24)
 #define DRAGON_DEFAULT_SWITCH_AUTO 1
@@ -158,6 +158,12 @@ static inline void dragon_write_reg32(dragon_private* private,
     mmiowb();
 }
 
+static inline uint32_t dragon_read_reg32(dragon_private* private,
+                                      uint32_t dw_offset)
+{
+    return ioread32(private->io_buffer + ((dw_offset) << 2));
+}
+
 static void dragon_write_params(dragon_private* private,
                                 dragon_params* params)
 {
@@ -174,13 +180,13 @@ static void dragon_write_params(dragon_private* private,
 
     if (VAL_CHANGED(frame_length))
     {
-        dragon_write_reg32(private, 7, VAL(frame_length)/6 - 1);
+        dragon_write_reg32(private, 7, VAL(frame_length)/8 - 1);
     }
 
     if (VAL_CHANGED(frames_per_buffer))
     {
         dragon_write_reg32(private, 6,
-                           VAL(frames_per_buffer)*VAL(frame_length)/90);
+                           VAL(frames_per_buffer)*VAL(frame_length)/DRAGON_DATA_PER_PACKET - 1);
     }
 
     if (  VAL_CHANGED(switch_period)  |
@@ -188,9 +194,10 @@ static void dragon_write_params(dragon_private* private,
           VAL_CHANGED(switch_state)   )
     {
         dragon_write_reg32(private, 5,
-                           VAL(switch_period)         |
+                           (VAL(switch_period - 1))         |
                            (VAL(switch_auto) << 24)   |
-                           (VAL(switch_state) << 25)  );
+                           (VAL(switch_state) << 25)  
+				); //|(1<<26)); //testmode
     }
 
     if (  VAL_CHANGED(half_shift)   |
@@ -225,8 +232,8 @@ static long dragon_set_activity(dragon_private *private, int arg)
     else
     {
         dragon_write_reg32(private, 1, 0); // disable DMA writing
-
         dragon_write_reg32(private, 0, 1); // assert reset signal in FPGA: stop FIFOs, reset counters
+	msleep(100);
         dragon_write_reg32(private, 0, 0); // deassert reset
     }
 
@@ -395,6 +402,7 @@ static long dragon_query_buffer(dragon_private *private, dragon_buffer *buffer)
 static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
 {
     dragon_buffer_opaque *opaque;
+    uint32_t addr_read;
 
     if (!buffer || buffer->idx >= private->buf_count)
     {
@@ -426,7 +434,8 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
 
     atomic_inc(&private->queue_length);
     dragon_write_reg32(private, 2, opaque->dma_handle);
-
+    addr_read = dragon_read_reg32(private, 2);
+    printk(KERN_INFO "w:%x r:%x", (unsigned int)opaque->dma_handle, addr_read);
     return 0;
 }
 
@@ -551,6 +560,10 @@ static long dragon_ioctl(struct file *file,
     case DRAGON_DQBUF:
         err = dragon_dqbuf(private, parg);
         break;
+    case DRAGON_GET_ID:
+	if(parg)
+	    *(uint32_t*)parg = dragon_read_reg32(private, 8);
+	break;
 
     default: err = -EINVAL;
     }
@@ -648,7 +661,7 @@ static int dragon_release(struct inode *inode, struct file *file)
     printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
 
     //Wait for completeness
-    while (atomic_read(&private->queue_length) > 0) msleep(100);
+    //while (atomic_read(&private->queue_length) > 0) msleep(100);
 
     dragon_set_activity(private, 0);
 
