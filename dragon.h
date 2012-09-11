@@ -33,6 +33,7 @@ typedef struct dragon_params
     uint32_t sync_offset;    // ticks, 0 to 511
     uint32_t sync_width;     // ticks, 0 to 127
     uint32_t dac_data;       // four bytes for 4 adjustment DACs on dragon board
+    uint32_t adc_type;	     // 0 for 8-bit, 1 for 12-bit
 } dragon_params;
 
 typedef struct dragon_buffer
