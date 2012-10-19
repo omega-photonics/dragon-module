@@ -35,6 +35,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define DRAGON_BUFFER_ORDER 10
 #define DRAGON_DEFAULT_DAC_DATA 0xFFFFFFFF
 #define DRAGON_DEFAULT_ADC_TYPE 0
+#define DRAGON_DEFAULT_BOARD_TYPE 0
 
 static const char DRV_NAME[] = "dragon";
 static struct class *dragon_class;
@@ -92,6 +93,7 @@ static void dragon_params_set_defaults(dragon_params* params)
     params->sync_width        = DRAGON_DEFAULT_SYNC_WIDTH;
     params->dac_data          = DRAGON_DEFAULT_DAC_DATA;
     params->adc_type	      = DRAGON_DEFAULT_ADC_TYPE;
+    params->board_type	      = DRAGON_DEFAULT_BOARD_TYPE;
 }
 
 static int dragon_check_params(dragon_params* params)
@@ -194,13 +196,15 @@ static void dragon_write_params(dragon_private* private,
     if (  VAL_CHANGED(switch_period)  |
           VAL_CHANGED(switch_auto)    |
           VAL_CHANGED(switch_state)   |
-	  VAL_CHANGED(adc_type))
+          VAL_CHANGED(adc_type)       |
+          VAL_CHANGED(board_type))
     {
         dragon_write_reg32(private, 5,
                            (VAL(switch_period - 1))         |
                            (VAL(switch_auto) << 24)   |
                            (VAL(switch_state) << 25) |
-			   (VAL(adc_type) << 28)
+                           (VAL(adc_type) << 28) |
+                           (VAL(board_type) << 29)
 				); //|(1<<26)); //testmode
     }
 

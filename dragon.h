@@ -34,6 +34,7 @@ typedef struct dragon_params
     uint32_t sync_width;     // ticks, 0 to 127
     uint32_t dac_data;       // four bytes for 4 adjustment DACs on dragon board
     uint32_t adc_type;	     // 0 for 8-bit, 1 for 12-bit
+    uint32_t board_type;	 // 0 for red KNJN, 1 for new green
 } dragon_params;
 
 typedef struct dragon_buffer
@@ -53,6 +54,6 @@ typedef struct dragon_buffer
 #define DRAGON_QUERY_BUFFER         _IOWR('D', 5, dragon_buffer*)
 #define DRAGON_QBUF                 _IOWR('D', 6, dragon_buffer*)
 #define DRAGON_DQBUF                _IOWR('D', 7, dragon_buffer*)
-#define DRAGON_GET_ID		    _IOWR('D', 8, uint32_t*)
+#define DRAGON_GET_ID               _IOWR('D', 8, uint32_t*)
 
 #endif //DRAGON_DEFINITIONS_HEADER
