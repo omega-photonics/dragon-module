@@ -688,6 +688,7 @@ static int dragon_release(struct inode *inode, struct file *file)
     private->on_release = 1;
     spin_unlock(&private->lists_lock);
     //Wait for completeness
+    /*
     while (atomic_read(&private->queue_length) > 0)
     {
         DEFINE_WAIT(wait_for_completeness);
@@ -697,6 +698,7 @@ static int dragon_release(struct inode *inode, struct file *file)
             schedule();
         finish_wait(&private->wait, &wait_for_completeness);
     }
+    */
 
     dragon_set_activity(private, 0);
 
