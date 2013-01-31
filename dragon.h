@@ -51,9 +51,10 @@ typedef struct dragon_buffer
 #define DRAGON_QUERY_PARAMS         _IOWR('D', 2, dragon_params*)
 #define DRAGON_SET_PARAMS           _IOWR('D', 3, dragon_params*)
 #define DRAGON_REQUEST_BUFFERS      _IOWR('D', 4, size_t*)
-#define DRAGON_QUERY_BUFFER         _IOWR('D', 5, dragon_buffer*)
-#define DRAGON_QBUF                 _IOWR('D', 6, dragon_buffer*)
-#define DRAGON_DQBUF                _IOWR('D', 7, dragon_buffer*)
-#define DRAGON_GET_ID               _IOWR('D', 8, uint32_t*)
+#define DRAGON_RELEASE_BUFFERS      _IOWR('D', 5, void*)
+#define DRAGON_QUERY_BUFFER         _IOWR('D', 6, dragon_buffer*)
+#define DRAGON_QBUF                 _IOWR('D', 7, dragon_buffer*)
+#define DRAGON_DQBUF                _IOWR('D', 8, dragon_buffer*)
+#define DRAGON_GET_ID               _IOWR('D', 9, uint32_t*)
 
 #endif //DRAGON_DEFINITIONS_HEADER

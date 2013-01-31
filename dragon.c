@@ -76,7 +76,8 @@ typedef struct dragon_private
     spinlock_t lists_lock;
     spinlock_t page_table_lock;
     wait_queue_head_t wait;
-    int on_release;
+    int activity;
+    spinlock_t activity_lock;
 } dragon_private;
 
 
@@ -169,7 +170,7 @@ static inline uint32_t dragon_read_reg32(dragon_private* private,
     return ioread32(private->io_buffer + ((dw_offset) << 2));
 }
 
-static void dragon_write_params(dragon_private* private,
+static long dragon_write_params(dragon_private* private,
                                 dragon_params* params)
 {
 #ifdef VAL_CHANGED
@@ -182,6 +183,16 @@ static void dragon_write_params(dragon_private* private,
 #undef VAL
 #endif
 #define VAL(name) private->params.name
+
+    long err = 0;
+
+    spin_lock(&private->activity_lock);
+    if (private->activity)
+    {
+        printk(KERN_INFO "Couldn't set params while in active mode\n");
+        err = -EAGAIN;
+        goto unlock;
+    }
 
     if (VAL_CHANGED(frame_length))
     {
@@ -228,6 +239,11 @@ static void dragon_write_params(dragon_private* private,
         dragon_write_reg32(private, 3, VAL(dac_data));
     }
 
+unlock:
+    spin_unlock(&private->activity_lock);
+    return err;
+
+
 #undef  VAL
 #undef  VAL_CHANGED
 }
@@ -237,9 +253,27 @@ static long dragon_set_activity(dragon_private *private, int arg)
     if (arg)
     {
         dragon_write_reg32(private, 1, 1); // start DMA writing
+        spin_lock(&private->activity_lock);
+        private->activity = 1;
+        spin_unlock(&private->activity_lock);
     }
     else
     {
+        spin_lock(&private->activity_lock);
+        private->activity = 0;
+        spin_unlock(&private->activity_lock);
+
+        //Wait for completeness
+        while (atomic_read(&private->queue_length) > 0)
+        {
+            DEFINE_WAIT(wait_for_completeness);
+            prepare_to_wait(&private->wait, &wait_for_completeness,
+                            TASK_INTERRUPTIBLE);
+            if (atomic_read(&private->queue_length) > 0)
+                schedule();
+            finish_wait(&private->wait, &wait_for_completeness);
+        }
+
         dragon_write_reg32(private, 1, 0); // disable DMA writing
         dragon_write_reg32(private, 0, 1); // assert reset signal in FPGA: stop FIFOs, reset counters
         msleep(100);
@@ -278,9 +312,18 @@ static void dragon_unlock_pages(dragon_private* private,
 
 }
 
-static void dragon_release_buffers(dragon_private* private)
+static long dragon_release_buffers(dragon_private* private)
 {
     int i;
+    long err = 0;
+
+    spin_lock(&private->activity_lock);
+    if (private->activity)
+    {
+        printk(KERN_INFO "Couldn't release buffers while in active mode\n");
+        err = -EAGAIN;
+        goto unlock;
+    }
 
     if (private->buffers)
     {
@@ -306,26 +349,49 @@ static void dragon_release_buffers(dragon_private* private)
 
     private->qlist_head = 0;
     private->dqlist_head = 0;
+
+unlock:
+    spin_unlock(&private->activity_lock);
+    return err;
 }
 
 static long dragon_request_buffers(dragon_private* private, size_t *count)
 {
     size_t i, idx = 0;
+    long err = 0;
     dragon_buffer_opaque *buffers;
     size_t buffer_size =
         (private->params.frame_length/DRAGON_DATA_PER_PACKET)*DRAGON_PACKET_SIZE_BYTES*
          private->params.frames_per_buffer;
 
-    if (!buffer_size || *count > DRAGON_MAX_BUFFER_COUNT)
+    spin_lock(&private->activity_lock);
+    if (private->activity)
     {
+        printk(KERN_INFO "Couldn't request buffers while in active mode\n");
+        err = -EAGAIN;
+        goto unlock;
+    }
+
+    if (!buffer_size)
+    {
+        printk(KERN_INFO "Zero buffer size\n");
+        err = -EINVAL;
+        goto unlock;
+    }
+
+    if (*count > DRAGON_MAX_BUFFER_COUNT)
+    {
+        printk(KERN_INFO "Too much number of requested buffers\n");
         *count = 0;
-        return -EINVAL;
+        err = -EINVAL;
+        goto unlock;
     }
 
     if(get_order(buffer_size) > DRAGON_BUFFER_ORDER)
     {
         printk(KERN_INFO "dragon buffer size is too big\n");
-        return -EINVAL;
+        err = -EINVAL;
+        goto unlock;
     }
 
 
@@ -333,14 +399,15 @@ static long dragon_request_buffers(dragon_private* private, size_t *count)
     {
         // buffers already available
         *count = private->buf_count;
-        return 0;
+        goto unlock;
     }
 
     buffers = vmalloc_32(*count*sizeof(dragon_buffer_opaque));
     if (!buffers)
     {
         printk(KERN_INFO "dragon buffers array allocation failed\n");
-        return -ENOMEM;
+        err = -ENOMEM;
+        goto unlock;
     }
     memset(buffers, 0, *count*sizeof(dragon_buffer_opaque));
 
@@ -388,13 +455,16 @@ static long dragon_request_buffers(dragon_private* private, size_t *count)
     {
         vfree(buffers);
         printk(KERN_INFO "dragon couldn't allocate or map buffer\n");
-        return -ENOMEM;
+        err = -ENOMEM;
+        goto unlock;
     }
 
     private->buffers = buffers;
     private->buf_count = *count = i;
 
-    return 0;
+unlock:
+    spin_unlock(&private->activity_lock);
+    return err;
 }
 
 static long dragon_query_buffer(dragon_private *private, dragon_buffer *buffer)
@@ -413,21 +483,35 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
 {
     dragon_buffer_opaque *opaque;
     uint32_t addr_read;
+    long err = 0;
+    size_t buffer_size =
+        (private->params.frame_length/DRAGON_DATA_PER_PACKET)*DRAGON_PACKET_SIZE_BYTES*
+        private->params.frames_per_buffer;
+
+    spin_lock(&private->activity_lock);
+    if (!private->activity)
+    {
+        printk(KERN_INFO "Couldn't queue buffer while in non-active mode\n");
+        err = -EAGAIN;
+        goto unlock;
+    }
 
     if (!buffer || buffer->idx >= private->buf_count)
     {
-        return -EINVAL;
+        err = -EINVAL;
+        goto unlock;
     }
 
     opaque = &private->buffers[buffer->idx];
 
-    spin_lock(&private->lists_lock);
-
-    if (private->on_release)
+    if (opaque->buf.len < buffer_size)
     {
-        spin_unlock(&private->lists_lock);
-        return 0;
+        printk(KERN_INFO "Couldn't queue small size buffer\n");
+        err = -EAGAIN;
+        goto unlock;
     }
+
+    spin_lock(&private->lists_lock);
 
     if (private->qlist_head)
     {
@@ -452,7 +536,9 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
     dragon_write_reg32(private, 2, opaque->dma_handle);
     addr_read = dragon_read_reg32(private, 2);
 
-    return 0;
+unlock:
+    spin_unlock(&private->activity_lock);
+    return err;
 }
 
 static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
@@ -484,16 +570,16 @@ static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
     }
     spin_unlock(&private->lists_lock);
 
-    addr_read = dragon_read_reg32(private, 2);
-    if (addr_read != (int32_t)opaque->dma_handle)
-    {
-        printk(KERN_INFO "Buffers queue is broken:\n");
-        printk(KERN_INFO "\t opaque->dma_handle = %08x, addr_read = %08x\n",
-               (int)opaque->dma_handle, addr_read);
-    }
-
     if (!err && !atomic_cmpxchg(&opaque->owned_by_cpu, 0, 1))
     {
+        addr_read = dragon_read_reg32(private, 2);
+        if (addr_read != (int32_t)opaque->dma_handle)
+        {
+            printk(KERN_INFO "Buffers queue is broken:\n");
+            printk(KERN_INFO "\t opaque->dma_handle = %08x, addr_read = %08x\n",
+                   (int)opaque->dma_handle, addr_read);
+        }
+
         pci_dma_sync_single_for_cpu(private->pci_dev,
                                     opaque->dma_handle,
                                     opaque->buf.len,
@@ -567,11 +653,15 @@ static long dragon_ioctl(struct file *file,
     case DRAGON_SET_PARAMS:
         if (dragon_check_params(parg))
             return -EINVAL;
-        dragon_write_params(private, parg);
+        err = dragon_write_params(private, parg);
         break;
 
     case DRAGON_REQUEST_BUFFERS:
         err = dragon_request_buffers(private, parg);
+        break;
+
+    case DRAGON_RELEASE_BUFFERS:
+        err = dragon_release_buffers(private);
         break;
 
     case DRAGON_QUERY_BUFFER:
@@ -646,6 +736,7 @@ static int dragon_open(struct inode *inode, struct file *file)
     init_waitqueue_head(&private->wait);
     spin_lock_init(&private->lists_lock);
     spin_lock_init(&private->page_table_lock);
+    spin_lock_init(&private->activity_lock);
     atomic_set(&private->queue_length, 0);
 
     //Init IRQ
@@ -657,7 +748,6 @@ static int dragon_open(struct inode *inode, struct file *file)
     }
 
     //Write default params to device
-    private->on_release = 0;
     dragon_params_set_defaults(&private->params);
     dragon_check_params(&private->params);
     dragon_write_params(private, NULL);
@@ -683,22 +773,6 @@ static int dragon_release(struct inode *inode, struct file *file)
         printk(KERN_INFO "dragon release error: private data pointer is zero\n");
         return -1;
     }
-
-    spin_lock(&private->lists_lock);
-    private->on_release = 1;
-    spin_unlock(&private->lists_lock);
-    //Wait for completeness
-    /*
-    while (atomic_read(&private->queue_length) > 0)
-    {
-        DEFINE_WAIT(wait_for_completeness);
-        prepare_to_wait(&private->wait, &wait_for_completeness,
-                        TASK_INTERRUPTIBLE);
-        if (atomic_read(&private->queue_length) > 0)
-            schedule();
-        finish_wait(&private->wait, &wait_for_completeness);
-    }
-    */
 
     dragon_set_activity(private, 0);
 
