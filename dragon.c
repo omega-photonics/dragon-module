@@ -76,6 +76,7 @@ typedef struct dragon_private
     spinlock_t lists_lock;
     spinlock_t page_table_lock;
     wait_queue_head_t wait;
+    int on_release;
 } dragon_private;
 
 
@@ -92,8 +93,8 @@ static void dragon_params_set_defaults(dragon_params* params)
     params->sync_offset       = DRAGON_DEFAULT_SYNC_OFFSET;
     params->sync_width        = DRAGON_DEFAULT_SYNC_WIDTH;
     params->dac_data          = DRAGON_DEFAULT_DAC_DATA;
-    params->adc_type	      = DRAGON_DEFAULT_ADC_TYPE;
-    params->board_type	      = DRAGON_DEFAULT_BOARD_TYPE;
+    params->adc_type          = DRAGON_DEFAULT_ADC_TYPE;
+    params->board_type        = DRAGON_DEFAULT_BOARD_TYPE;
 }
 
 static int dragon_check_params(dragon_params* params)
@@ -205,7 +206,7 @@ static void dragon_write_params(dragon_private* private,
                            (VAL(switch_state) << 25) |
                            (VAL(adc_type) << 28) |
                            (VAL(board_type) << 29)
-				); //|(1<<26)); //testmode
+                                ); //|(1<<26)); //testmode
     }
 
     if (  VAL_CHANGED(half_shift)   |
@@ -241,7 +242,7 @@ static long dragon_set_activity(dragon_private *private, int arg)
     {
         dragon_write_reg32(private, 1, 0); // disable DMA writing
         dragon_write_reg32(private, 0, 1); // assert reset signal in FPGA: stop FIFOs, reset counters
-	msleep(100);
+        msleep(100);
         dragon_write_reg32(private, 0, 0); // deassert reset
     }
 
@@ -369,6 +370,7 @@ static long dragon_request_buffers(dragon_private* private, size_t *count)
             free_pages((unsigned long)buffers[i].buf.ptr, DRAGON_BUFFER_ORDER);
             break;
         }
+
         buffers[i].buf.offset = buffers[i].dma_handle;
         buffers[i].buf.idx = i;
         atomic_set(&buffers[i].owned_by_cpu, 0);
@@ -421,6 +423,12 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
 
     spin_lock(&private->lists_lock);
 
+    if (private->on_release)
+    {
+        spin_unlock(&private->lists_lock);
+        return 0;
+    }
+
     if (private->qlist_head)
     {
         list_add_tail(&opaque->qlist, private->qlist_head);
@@ -443,7 +451,7 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
     atomic_inc(&private->queue_length);
     dragon_write_reg32(private, 2, opaque->dma_handle);
     addr_read = dragon_read_reg32(private, 2);
-    printk(KERN_INFO "w:%x r:%x", (unsigned int)opaque->dma_handle, addr_read);
+
     return 0;
 }
 
@@ -451,8 +459,9 @@ static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
 {
 
     struct list_head *dqlist_next = 0;
-    dragon_buffer_opaque *opaque;
+    dragon_buffer_opaque *opaque = 0;
     long err = 0;
+    int32_t addr_read;
 
 
     spin_lock(&private->lists_lock);
@@ -474,6 +483,14 @@ static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
         private->dqlist_head = dqlist_next;
     }
     spin_unlock(&private->lists_lock);
+
+    addr_read = dragon_read_reg32(private, 2);
+    if (addr_read != (int32_t)opaque->dma_handle)
+    {
+        printk(KERN_INFO "Buffers queue is broken:\n");
+        printk(KERN_INFO "\t opaque->dma_handle = %08x, addr_read = %08x\n",
+               (int)opaque->dma_handle, addr_read);
+    }
 
     if (!err && !atomic_cmpxchg(&opaque->owned_by_cpu, 0, 1))
     {
@@ -569,9 +586,9 @@ static long dragon_ioctl(struct file *file,
         err = dragon_dqbuf(private, parg);
         break;
     case DRAGON_GET_ID:
-	if(parg)
-	    *(uint32_t*)parg = dragon_read_reg32(private, 8);
-	break;
+        if(parg)
+            *(uint32_t*)parg = dragon_read_reg32(private, 8);
+        break;
 
     default: err = -EINVAL;
     }
@@ -640,6 +657,7 @@ static int dragon_open(struct inode *inode, struct file *file)
     }
 
     //Write default params to device
+    private->on_release = 0;
     dragon_params_set_defaults(&private->params);
     dragon_check_params(&private->params);
     dragon_write_params(private, NULL);
@@ -666,10 +684,19 @@ static int dragon_release(struct inode *inode, struct file *file)
         return -1;
     }
 
-    printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
-
+    spin_lock(&private->lists_lock);
+    private->on_release = 1;
+    spin_unlock(&private->lists_lock);
     //Wait for completeness
-    //while (atomic_read(&private->queue_length) > 0) msleep(100);
+    while (atomic_read(&private->queue_length) > 0)
+    {
+        DEFINE_WAIT(wait_for_completeness);
+        prepare_to_wait(&private->wait, &wait_for_completeness,
+                        TASK_INTERRUPTIBLE);
+        if (atomic_read(&private->queue_length) > 0)
+            schedule();
+        finish_wait(&private->wait, &wait_for_completeness);
+    }
 
     dragon_set_activity(private, 0);
 
@@ -680,6 +707,8 @@ static int dragon_release(struct inode *inode, struct file *file)
     file->private_data = 0;
 
     atomic_inc(&private->dev_available);
+
+    printk(KERN_INFO "release dragon device %d\n", MINOR(private->cdev_no));
 
     return 0;
 }
@@ -714,7 +743,6 @@ static unsigned int dragon_poll(struct file *file, struct poll_table_struct *pol
 static int dragon_mmap(struct file *file, struct vm_area_struct *vma)
 {
     vma->vm_flags |= VM_IO | VM_RESERVED;
-    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
     if ( io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
                             vma->vm_end - vma->vm_start,
