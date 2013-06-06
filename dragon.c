@@ -818,7 +818,7 @@ static unsigned int dragon_poll(struct file *file, struct poll_table_struct *pol
 
 static int dragon_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    vma->vm_flags |= VM_IO | VM_RESERVED;
+    vma->vm_flags |= VM_IO;
 
     if ( io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
                             vma->vm_end - vma->vm_start,
@@ -837,7 +837,7 @@ static const struct file_operations dragon_fops = {
     .unlocked_ioctl   =  dragon_ioctl,
 };
 
-static int __devinit probe(struct pci_dev *dev, const struct pci_device_id *id)
+static int probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
     dev_t cdev_no;
     struct dragon_private *private = 0;
@@ -942,7 +942,7 @@ err_alloc:
     return -1;
 }
 
-static void __devexit remove(struct pci_dev *dev)
+static void remove(struct pci_dev *dev)
 {
     unsigned cdev_no;
     struct dragon_private *private = pci_get_drvdata(dev);
@@ -977,7 +977,7 @@ static struct pci_driver dragon_driver = {
 };
 
 
-static int __init dragon_init(void)
+static int dragon_init(void)
 {
     printk(KERN_INFO "dragon module init\n");
 
@@ -997,7 +997,7 @@ static int __init dragon_init(void)
     return pci_register_driver(&dragon_driver);
 }
 
-static void __exit dragon_exit(void)
+static void dragon_exit(void)
 {
     pci_unregister_driver(&dragon_driver);
 
