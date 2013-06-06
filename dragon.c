@@ -972,7 +972,7 @@ static struct pci_driver dragon_driver = {
     .name = (char*)DRV_NAME,
     .id_table = dragon_ids,
     .probe = probe,
-    .remove = __devexit_p(remove),
+    .remove = remove,
     /* resume, suspend are optional */
 };
 
