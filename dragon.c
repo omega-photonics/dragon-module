@@ -481,6 +481,7 @@ static long dragon_query_buffer(dragon_private *private, dragon_buffer *buffer)
 
 static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
 {
+    unsigned long irq_flags;
     dragon_buffer_opaque *opaque;
     uint32_t addr_read;
     long err = 0;
@@ -511,7 +512,7 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
         goto unlock;
     }
 
-    spin_lock(&private->lists_lock);
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
 
     if (private->qlist_head)
     {
@@ -522,7 +523,7 @@ static long dragon_qbuf(dragon_private *private, dragon_buffer *buffer)
         private->qlist_head = &opaque->qlist;
     }
 
-    spin_unlock(&private->lists_lock);
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
 
     if (atomic_cmpxchg(&opaque->owned_by_cpu, 1, 0))
     {
@@ -543,14 +544,14 @@ unlock:
 
 static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
 {
-
+    unsigned long irq_flags;
     struct list_head *dqlist_next = 0;
     dragon_buffer_opaque *opaque = 0;
     long err = 0;
     int32_t addr_read;
 
 
-    spin_lock(&private->lists_lock);
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
     if (!private->dqlist_head)
     {
         err = -EAGAIN;
@@ -568,7 +569,7 @@ static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
         list_del_init(private->dqlist_head);
         private->dqlist_head = dqlist_next;
     }
-    spin_unlock(&private->lists_lock);
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
 
     if (!err && !atomic_cmpxchg(&opaque->owned_by_cpu, 0, 1))
     {
@@ -591,10 +592,11 @@ static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
 
 static void dragon_switch_one_buffer(dragon_private *private)
 {
+    unsigned long irq_flags;
     struct list_head *qlist_next = 0;
     dragon_buffer_opaque *opaque;
 
-    spin_lock(&private->lists_lock);
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
     if (!private->qlist_head)
     {
         printk(KERN_INFO "Buffers queue is empty\n");
@@ -619,7 +621,7 @@ static void dragon_switch_one_buffer(dragon_private *private)
 
         private->qlist_head = qlist_next;
     }
-    spin_unlock(&private->lists_lock);
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
 }
 
 static long dragon_ioctl(struct file *file,
@@ -791,26 +793,27 @@ static int dragon_release(struct inode *inode, struct file *file)
 
 static unsigned int dragon_poll(struct file *file, struct poll_table_struct *poll_table)
 {
+    unsigned long irq_flags;
     dragon_private *private = file->private_data;
     unsigned int ret = 0;
 
-    spin_lock(&private->lists_lock);
+    spin_lock_irqsave(&private->lists_lock, irq_flags);
     if (private->dqlist_head)
     {
         ret = POLLIN | POLLRDNORM;
     }
-    spin_unlock(&private->lists_lock);
+    spin_unlock_irqrestore(&private->lists_lock, irq_flags);
 
     if (!ret)
     {
         poll_wait(file, &private->wait, poll_table);
 
-        spin_lock(&private->lists_lock);
+        spin_lock_irqsave(&private->lists_lock, irq_flags);
         if (private->dqlist_head)
         {
             ret = POLLIN | POLLRDNORM;
         }
-        spin_unlock(&private->lists_lock);
+        spin_unlock_irqrestore(&private->lists_lock, irq_flags);
     }
 
     return ret;
