@@ -24,9 +24,10 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 #define DRAGON_DEFAULT_FRAME_LENGTH 65520
 #define DRAGON_DEFAULT_FRAMES_PER_BUFFER 60
-#define DRAGON_DEFAULT_SWITCH_PERIOD (1 << 24)
-#define DRAGON_DEFAULT_SWITCH_AUTO 1
-#define DRAGON_DEFAULT_SWITCH_STATE 0
+//#define DRAGON_DEFAULT_SWITCH_PERIOD (1 << 24)
+//#define DRAGON_DEFAULT_SWITCH_AUTO 1
+//#define DRAGON_DEFAULT_SWITCH_STATE 0
+#define DRAGON_DEFAULT_PULSE_MASK 0x80000000
 #define DRAGON_DEFAULT_HALF_SHIFT 0
 #define DRAGON_DEFAULT_CHANNEL_AUTO 0
 #define DRAGON_DEFAULT_CHANNEL 0
@@ -85,17 +86,18 @@ static void dragon_params_set_defaults(dragon_params* params)
 {
     params->frame_length      = DRAGON_DEFAULT_FRAME_LENGTH;
     params->frames_per_buffer = DRAGON_DEFAULT_FRAMES_PER_BUFFER;
-    params->switch_period     = DRAGON_DEFAULT_SWITCH_PERIOD;
-    params->switch_auto       = DRAGON_DEFAULT_SWITCH_AUTO;
-    params->switch_state      = DRAGON_DEFAULT_SWITCH_STATE;
+    //params->switch_period     = DRAGON_DEFAULT_SWITCH_PERIOD;
+    //params->switch_auto       = DRAGON_DEFAULT_SWITCH_AUTO;
+    //params->switch_state      = DRAGON_DEFAULT_SWITCH_STATE;
+    params->pulse_mask        = DRAGON_DEFAULT_PULSE_MASK;
     params->half_shift        = DRAGON_DEFAULT_HALF_SHIFT;
     params->channel_auto      = DRAGON_DEFAULT_CHANNEL_AUTO;
     params->channel           = DRAGON_DEFAULT_CHANNEL;
     params->sync_offset       = DRAGON_DEFAULT_SYNC_OFFSET;
     params->sync_width        = DRAGON_DEFAULT_SYNC_WIDTH;
     params->dac_data          = DRAGON_DEFAULT_DAC_DATA;
-    params->adc_type          = DRAGON_DEFAULT_ADC_TYPE;
-    params->board_type        = DRAGON_DEFAULT_BOARD_TYPE;
+    //params->adc_type          = DRAGON_DEFAULT_ADC_TYPE;
+    //params->board_type        = DRAGON_DEFAULT_BOARD_TYPE;
 }
 
 static int dragon_check_params(dragon_params* params)
@@ -121,6 +123,7 @@ static int dragon_check_params(dragon_params* params)
         return -EINVAL;
     }
 
+    /*
     if (1 <= params->switch_period && params->switch_period <= (1 << 24))
     {
         if (params->switch_period < params->frames_per_buffer)
@@ -135,20 +138,22 @@ static int dragon_check_params(dragon_params* params)
         printk(KERN_INFO "Bad dragon switch_period value\n");
         return -EINVAL;
     }
+    */
 
     params->half_shift &= 1;
     params->channel_auto &= 1;
     params->channel &= 1;
-    params->switch_auto &= 1;
-    params->switch_state &= 1;
+    //params->switch_auto &= 1;
+    //params->switch_state &= 1;
 
-    if (params->sync_offset > 511)
+    if (params->sync_width > 127)
     {
-        printk(KERN_INFO "Bad dragon sync_offset value\n");
+        printk(KERN_INFO "Bad dragon sync_width value\n");
         return -EINVAL;
     }
 
-    if (params->sync_offset > 127)
+
+    if (params->sync_offset > 511)
     {
         printk(KERN_INFO "Bad dragon sync_offset value\n");
         return -EINVAL;
@@ -205,6 +210,7 @@ static long dragon_write_params(dragon_private* private,
                            VAL(frames_per_buffer)*VAL(frame_length)/DRAGON_DATA_PER_PACKET - 1);
     }
 
+    /*
     if (  VAL_CHANGED(switch_period)  |
           VAL_CHANGED(switch_auto)    |
           VAL_CHANGED(switch_state)   |
@@ -218,6 +224,11 @@ static long dragon_write_params(dragon_private* private,
                            (VAL(adc_type) << 28) |
                            (VAL(board_type) << 29)
                                 ); //|(1<<26)); //testmode
+    }
+    */
+    if (  VAL_CHANGED(pulse_mask) )
+    {
+        dragon_write_reg32(private, 5, VAL(pulse_mask));
     }
 
     if (  VAL_CHANGED(half_shift)   |
@@ -582,7 +593,7 @@ static long dragon_dqbuf(dragon_private *private, dragon_buffer *buffer)
         }
 
         pci_dma_sync_single_for_cpu(private->pci_dev,
-                                    opaque->dma_handle,
+                                    addr_read,
                                     opaque->buf.len,
                                     PCI_DMA_FROMDEVICE);
     }

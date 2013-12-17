@@ -23,18 +23,19 @@ typedef struct dragon_params
                             // must be multiple of 120 or will be rounded up
     uint32_t frames_per_buffer; // count of frames in one buffer, 1 to 32768,
                                 // (frame_length*frames_per_buffer) must be less or equal 65520*60
-    uint32_t switch_period;  // frames, 1 to 2^24, must be multiple of frames_per_buffer
+    //uint32_t switch_period;  // frames, 1 to 2^24, must be multiple of frames_per_buffer
                              // or will be rounded up
-    uint32_t switch_auto;    // 1 - auto (switch_period), 0 - manual
-    uint32_t switch_state;   // can be set 0 or 1 if switch_auto==0
+    //uint32_t switch_auto;    // 1 - auto (switch_period), 0 - manual
+    //uint32_t switch_state;   // can be set 0 or 1 if switch_auto==0
+    uint32_t pulse_mask;
     uint32_t half_shift;     // 0 or 1 - shifts sync pulse 1/2tick forward
     uint32_t channel_auto;   // 1: auto, 0: manual channel selection
     uint32_t channel;        // select adc - 0 or 1; works only if channel_auto = 0
     uint32_t sync_offset;    // ticks, 0 to 511
     uint32_t sync_width;     // ticks, 0 to 127
     uint32_t dac_data;       // four bytes for 4 adjustment DACs on dragon board
-    uint32_t adc_type;       // 0 for 8-bit, 1 for 12-bit
-    uint32_t board_type;         // 0 for red KNJN, 1 for new green
+    //uint32_t adc_type;       // 0 for 8-bit, 1 for 12-bit
+    //uint32_t board_type;         // 0 for red KNJN, 1 for new green
 } dragon_params;
 
 typedef struct dragon_buffer
